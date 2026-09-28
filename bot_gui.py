@@ -204,24 +204,31 @@ class BotGUI:
             self._err("体检失败", str(ex))
 
     def detect_window(self):
+        # ★ 在子进程里检测 (不把 pal_bot 导入 GUI 进程):
+        #   pal_bot 导入时会设置 DPI 感知, 会把 tkinter 界面缩小组件
+        exe = self.v_exe.get().strip() or sys.executable
+        code = ("import sys; sys.path.insert(0, r'%s')\n"
+                "from pal_bot import find_game_window\n"
+                "print(len(find_game_window()))\n" % BASE)
         try:
-            sys.path.insert(0, BASE)
-            from pal_bot import find_game_window
-            h = find_game_window()
-            if h:
-                self.log_line("[GUI] 找到游戏窗口: %d 个 (hwnd=%s)"
-                              % (len(h), h))
-                messagebox.showinfo("检测游戏窗口",
-                                    "找到 %d 个游戏窗口, 可以开始。" % len(h),
-                                    parent=self.root)
-            else:
-                self.log_line("[GUI] 未找到游戏窗口! 请先启动游戏 (SDLPAL)")
-                messagebox.showwarning(
-                    "检测游戏窗口",
-                    "未找到标题含 Pal 的游戏窗口。\n请先启动游戏再开始。",
-                    parent=self.root)
+            r = subprocess.run([exe, "-c", code], cwd=BASE, env=ENV_UTF8,
+                               capture_output=True, text=True,
+                               encoding="utf-8", errors="replace", timeout=30)
+            n = int(r.stdout.strip().splitlines()[0])
         except Exception as ex:
             self._err("检测失败", str(ex))
+            return
+        if n:
+            self.log_line("[GUI] 找到游戏窗口: %d 个, 可以开始" % n)
+            messagebox.showinfo("检测游戏窗口",
+                                "找到 %d 个游戏窗口, 可以开始。" % n,
+                                parent=self.root)
+        else:
+            self.log_line("[GUI] 未找到游戏窗口! 请先启动游戏 (SDLPAL)")
+            messagebox.showwarning(
+                "检测游戏窗口",
+                "未找到标题含 Pal 的游戏窗口。\n请先启动游戏再开始。",
+                parent=self.root)
 
     def clear_log(self):
         self.log.config(state="normal")
@@ -301,16 +308,18 @@ class BotGUI:
 
     @staticmethod
     def _flush_game_keys():
-        """强制停止后冲洗游戏窗口全部按键, 防卡键走丢。"""
+        """强制停止后冲洗游戏窗口全部按键, 防卡键走丢。(子进程执行, 同上)"""
+        code = ("import sys, time; sys.path.insert(0, r'%s')\n"
+                "from pal_bot import find_game_window, Game\n"
+                "for h in find_game_window():\n"
+                "    g = Game(h)\n"
+                "    for _ in range(3):\n"
+                "        g.flush_keys(); time.sleep(0.1)\n"
+                "print('flushed')" % BASE)
         try:
-            sys.path.insert(0, BASE)
-            from pal_bot import find_game_window, Game
-            import time as _t
-            for hwnd in find_game_window():
-                g = Game(hwnd)
-                for _ in range(3):
-                    g.flush_keys()
-                    _t.sleep(0.1)
+            subprocess.run([sys.executable, "-c", code], cwd=BASE,
+                           env=ENV_UTF8, capture_output=True, timeout=30,
+                           creationflags=subprocess.CREATE_NO_WINDOW)
             print("[GUI] 已冲洗游戏按键")
         except Exception as ex:
             print("[GUI] 冲洗按键失败: %s" % ex)
