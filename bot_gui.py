@@ -11,6 +11,7 @@
 import os
 import re
 import sys
+import time
 import queue
 import subprocess
 import threading
@@ -160,10 +161,10 @@ class BotGUI:
         except Exception as ex:
             self._err("启动失败", str(ex))
             return
+        self._set_buttons(True)              # 先切按钮状态, 后续任何异常不影响
         self.wins = 0
         self.t_start = time.time()
         threading.Thread(target=self._reader, daemon=True).start()
-        self._set_buttons(True)
         self.log_line("[GUI] 已启动: %s" % " ".join(args[1:]))
 
     def stop(self):
