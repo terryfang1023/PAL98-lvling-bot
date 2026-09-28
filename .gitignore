@@ -1,0 +1,26 @@
+# 由游戏资源生成的数据 (版权衍生数据, 不入库, 用 tools/build_data.py 生成)
+*.npy
+*.npz
+gyt_scene_report.txt
+map_manifest.txt
+
+# 运行时产物
+bot_log*.txt
+*_longrun*.txt
+mem_stop.flag
+.pal_bot.lock
+hotspot.json
+mem_doors.json
+*.log
+
+# 诊断截图
+*.png
+*.jpg
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+build/
+dist/
+*.spec
