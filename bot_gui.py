@@ -26,6 +26,9 @@ STOP_FLAG = os.path.join(BASE, "mem_stop.flag")
 
 BIAS_CHOICES = ["", "上", "下", "左", "右", "右上", "右下", "左上", "左下"]
 
+# 子进程 (bot/体检) 强制 UTF-8 输出, 否则 Windows 管道默认 GBK -> 界面乱码
+ENV_UTF8 = dict(os.environ, PYTHONIOENCODING="utf-8")
+
 
 class BotGUI:
 
@@ -150,7 +153,7 @@ class BotGUI:
         # 3. 启动
         try:
             self.proc = subprocess.Popen(
-                args, cwd=BASE,
+                args, cwd=BASE, env=ENV_UTF8,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, encoding="utf-8", errors="replace",
                 creationflags=subprocess.CREATE_NO_WINDOW)
@@ -193,6 +196,7 @@ class BotGUI:
         exe = self.v_exe.get().strip() or sys.executable
         try:
             r = subprocess.run([exe, "scene_check.py"], cwd=BASE,
+                               env=ENV_UTF8,
                                capture_output=True, text=True,
                                encoding="utf-8", errors="replace", timeout=60)
             self.log_line("[体检] %s" % (r.stdout or r.stderr or "(无输出)"))
