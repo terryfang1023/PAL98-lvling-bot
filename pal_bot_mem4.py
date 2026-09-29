@@ -307,6 +307,7 @@ class MemBot4(MemBot3):
             anim[K] = anim.get(K, 0) + 1
             return None
         tries[(self.scene, K)] = tries.get((self.scene, K), 0) + 1
+        self._chase_goal = K          # ★ 目标格: 被挡时不记绕行 (怪挡路是正常的)
         self.log("[追怪] 发现动屑目标 场景%d K%s (屏(%d,%d) %d块, 距我%d格,"
                  " 第%d次) -> 优先追击"
                  % (self.scene, K, best[1][0], best[1][1], best[2], dist,
@@ -335,20 +336,39 @@ class MemBot4(MemBot3):
         ban, reach = self.plan_ctx(cur)                   # ★ 门禁分级 = 防出门
         cands = [c for c in reach if c not in ban and c != cur and c != exclude]
         if not cands:
-            if self.blocked:
-                perm = [c for c in list(self.blocked) if self._is_perm(c)]
-                n = len(self.blocked)
-                for c in list(self.blocked):
-                    if not self._is_perm(c):
-                        self.blocked.discard(c)
-                self._pc_key = None
-                self.log("[自愈] 全图候选为空 -> 清空 %d 条「被挡」重挑 (保留 %d 条长期禁入)"
-                         % (n - len(perm), len(perm)))
+            # 兜底①: 清掉临时绕行记录重挑
+            n1 = self._clear_blocked(keep_perm=True)
+            if n1:
+                self.log("[自愈] 全图候选为空 -> 清空 %d 条「被挡」重挑" % n1)
                 ban, reach = self.plan_ctx(cur)
                 cands = [c for c in reach
                          if c not in ban and c != cur and c != exclude]
+            # 兜底②: 长期禁入把当前位置困死 -> 解除身边的长期禁入
+            #   (实测: 窄路上两个出口全被升级 -> 原地空转 50 分钟只赢 1 场)
             if not cands:
+                n2 = self._release_perm_near(cur, 5)
+                if n2:
+                    self.log("[自愈] 长期禁入把当前位置困死 -> 解除身边 %d 条重挑" % n2)
+                    ban, reach = self.plan_ctx(cur)
+                    cands = [c for c in reach
+                             if c not in ban and c != cur and c != exclude]
+            # 兜底③: 还是无路 -> 绕行知识整体不可信, 全部清空重来
+            if not cands:
+                n3 = self._clear_blocked(keep_perm=False)
+                if n3:
+                    self.log("[自愈] 仍无路可走 -> 清空全部 %d 条绕行记录重挑" % n3)
+                    ban, reach = self.plan_ctx(cur)
+                    cands = [c for c in reach
+                             if c not in ban and c != cur and c != exclude]
+            if not cands:
+                # 连续多轮无路可走 -> 判定输入被吞, 菜单自救
+                self._dead_n = getattr(self, "_dead_n", 0) + 1
+                if self._dead_n >= 6:
+                    self._dead_n = 0
+                    self.log("[自愈] 连续 6 轮无候选 -> 判定输入被吞, 执行菜单自救")
+                    self.escape_menu()
                 return None
+        self._dead_n = 0
 
         anchor = self.hotK if self.hotK else self.startK
 
@@ -484,6 +504,7 @@ class MemBot4(MemBot3):
     # ------------------------------------------------------------------
     def fight(self, why=""):
         self._chase_tries = {}      # 开打了: 追怪计数清零 (怪是真的)
+        self._chase_goal = None     # 目标已达成, 解除"不记绕行"保护
         st = self.mem.state()
         sc, K = st["scene"], st["K"]
         # ① 进场确认: 真战斗不可能一进来就是结束画面

@@ -602,21 +602,34 @@ class MemBot2(V12.MemBot):
         cands = [c for c in reach if c not in ban
                  and max(abs(c[0] - anchor[0]), abs(c[1] - anchor[1])) <= self.RADIUS]
         if not cands:
-            # 兜底: 绕行知识把当前格糊死 -> 全部清掉重挑一次
-            #   (长期禁入格保留: 那是反复实测确认的硬阻挡, 清了只会再撞)
-            if self.blocked:
-                perm = [c for c in list(self.blocked) if self._is_perm(c)]
-                n = len(self.blocked)
-                for c in list(self.blocked):
-                    if not self._is_perm(c):
-                        self.blocked.discard(c)
-                self._pc_key = None
-                self.log("[自愈] 候选集为空 -> 清空 %d 条「被挡」记录重挑 (保留 %d 条长期禁入)"
-                         % (n - len(perm), len(perm)))
+            # 兜底①: 绕行知识把当前格糊死 -> 清掉临时记录重挑一次
+            #   (长期禁入先保留: 那是反复实测确认的阻挡)
+            n1 = self._clear_blocked(keep_perm=True)
+            if n1:
+                self.log("[自愈] 候选集为空 -> 清空 %d 条「被挡」记录重挑" % n1)
                 ban, reach = self.plan_ctx(cur)
                 cands = [c for c in reach if c not in ban
                          and max(abs(c[0] - anchor[0]),
                                  abs(c[1] - anchor[1])) <= self.RADIUS]
+            # 兜底②: 长期禁入把当前位置困死 (窄路上出口被全升级) ->
+            #   解除身边的长期禁入。移动能力优先于避让, 否则彻底死锁。
+            if not cands:
+                n2 = self._release_perm_near(cur, 5)
+                if n2:
+                    self.log("[自愈] 长期禁入把当前位置困死 -> 解除身边 %d 条重挑" % n2)
+                    ban, reach = self.plan_ctx(cur)
+                    cands = [c for c in reach if c not in ban
+                             and max(abs(c[0] - anchor[0]),
+                                     abs(c[1] - anchor[1])) <= self.RADIUS]
+            # 兜底③: 还是无路 -> 绕行知识整体不可信, 全部清空重来
+            if not cands:
+                n3 = self._clear_blocked(keep_perm=False)
+                if n3:
+                    self.log("[自愈] 仍无路可走 -> 清空全部 %d 条绕行记录重挑" % n3)
+                    ban, reach = self.plan_ctx(cur)
+                    cands = [c for c in reach if c not in ban
+                             and max(abs(c[0] - anchor[0]),
+                                     abs(c[1] - anchor[1])) <= self.RADIUS]
             if not cands:
                 self._dead_n = getattr(self, "_dead_n", 0) + 1
                 if self._dead_n >= 6:

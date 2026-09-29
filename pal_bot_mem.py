@@ -184,12 +184,39 @@ class MemBot:
     ESCALATE_WINDOW = 600.0      # 升级计数窗口 (秒); 超窗重新计数, 防误封游走NPC路过格
     ESCALATE_TTL = 1800.0        # 长期禁入持续时间 (秒), 到期自动解除
 
+    def _exit_count(self, cur):
+        """当前位置还剩几个可走出口 (4 邻中在可走域且未被禁的格数)。"""
+        try:
+            ks = self.kwalk(self.map) if self.map is not None else set()
+        except Exception:
+            return 99
+        n = 0
+        for dd in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            t = (cur[0] + dd[0], cur[1] + dd[1])
+            if t in ks and t not in self.blocked:
+                n += 1
+        return n
+
     def _ban_escalate(self, cell):
         """被挡升级: 同一格 10 分钟内被挡 3 次, 多为 NPC/怪等持久阻挡物,
         升级为长期禁入 (把 AgedSet 时间戳推到未来, 绕过 TTL 与孤岛自愈,
         30 分钟后自动解除 —— 临时阻挡物走后地图自动复原)。"""
         hits = getattr(self, "blocked_hits", None)
         if hits is None or not hasattr(self.blocked, "ts"):
+            return
+        # ★ 出口保护: 相邻格若是当前位置仅剩的出口之一, 绝不升级为长期禁入。
+        #   实测事故: 场景157 窄路上唯一两个出口都被升级 -> reach(cur) 只剩自己,
+        #   候选永远为空, 原地空转 50 分钟 (1068 次"候选为空") 只赢 1 场。
+        #   移动能力优先于避让 —— 宁可再撞一次, 也不能把自己锁死。
+        try:
+            cur = self.mem.state()["K"]
+        except Exception:
+            cur = None
+        if cur is not None and \
+                max(abs(cell[0] - cur[0]), abs(cell[1] - cur[1])) <= 1 and \
+                self._exit_count(cur) <= 1:
+            self.log("[绕行] K%s 是当前位置仅剩的出口 -> 只记临时绕行, 不长期禁入"
+                     % (cell,))
             return
         now = time.time()
         cnt, last = hits.get(cell, (0, 0.0))
@@ -211,6 +238,40 @@ class MemBot:
         """该格是否处于"长期禁入"状态 (时间戳被推到远期)。"""
         ts = getattr(self.blocked, "ts", None)
         return bool(ts) and ts.get(cell, 0) > time.time() + 60
+
+    def _release_perm_near(self, cur, radius=5):
+        """死锁自救: 解除当前位置附近的长期禁入格。
+        窄路上两个出口都被长期禁入 -> 完全走不出去, 此时移动优先于避让。"""
+        if not hasattr(self.blocked, "ts"):
+            return 0
+        hits = getattr(self, "blocked_hits", None)
+        n = 0
+        for c in list(self.blocked):
+            if not self._is_perm(c):
+                continue
+            if max(abs(c[0] - cur[0]), abs(c[1] - cur[1])) <= radius:
+                self.blocked.discard(c)
+                if hits is not None:
+                    hits.pop(c, None)      # 计数清零, 否则下次被挡立刻又升级
+                n += 1
+        if n:
+            self._pc_key = None
+        return n
+
+    def _clear_blocked(self, keep_perm=False):
+        """清空绕行记录 (含长期禁入)。返回清掉的条数。"""
+        hits = getattr(self, "blocked_hits", None)
+        n = 0
+        for c in list(self.blocked):
+            if keep_perm and self._is_perm(c):
+                continue
+            self.blocked.discard(c)
+            if hits is not None:
+                hits.pop(c, None)
+            n += 1
+        if n:
+            self._pc_key = None
+        return n
 
     def enter_scene(self, sc, why=""):
         self.scene = sc
@@ -370,8 +431,14 @@ class MemBot:
                     if self.maybe_fight():       # 可能是遇敌而非墙
                         return False
                     if time.time() - getattr(self, "_last_move_t", 0) < 90:
-                        self.blocked.add(path[i])
-                        self._ban_escalate(path[i])
+                        if path[i] == getattr(self, "_chase_goal", None):
+                            # ★ 追怪目标格: 走不进去多半是怪本身挡路(对象碰撞),
+                            #   地图数据是对的 -> 记绕行会误封目标, 反复升级成死锁
+                            self.log("[追怪] 目标格 %s 走不进去 (怪挡路?) -> 不记绕行"
+                                     % (path[i],))
+                        else:
+                            self.blocked.add(path[i])
+                            self._ban_escalate(path[i])
                     self.log("[MEM] 实测被挡(数据说可走): %s -> 记入绕行" % (path[i],))
                 return False
             self.visited.add(K1)
@@ -553,7 +620,8 @@ class MemBot:
                 return
         path = self.bfs_path(cur, {tgt})
         if path is None or len(path) < 2:
-            self.blocked.add(tgt)
+            if tgt != getattr(self, "_chase_goal", None):
+                self.blocked.add(tgt)
             self._spin = getattr(self, "_spin", 0) + 1
             if self._spin % 80 == 0:
                 # 绕行知识过密把局部地图糊死 -> 清掉周边污染, 换锚点重新测绘
