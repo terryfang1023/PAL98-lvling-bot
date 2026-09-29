@@ -661,7 +661,18 @@ if __name__ == "__main__":
         MemBot4.PATROL_R0 = int(sys.argv[3])
     if len(sys.argv) > 4:
         MemBot4.PATROL_RMAX = int(sys.argv[4])
-    bot = MemBot4(max_battles=maxb, max_seconds=secs)
+    # 第7参数: 无胜场保险秒数 (0=关闭该保险; 默认1200=20分钟没赢就停机)
+    stall = 1200
+    if len(sys.argv) > 7 and sys.argv[7].strip():
+        try:
+            stall = int(sys.argv[7])
+        except ValueError:
+            pass
+    if stall <= 0:
+        stall = 10 ** 9            # 事实上的"永不触发"
+    bot = MemBot4(max_battles=maxb, max_seconds=secs, stall_limit=stall)
+    if stall >= 10 ** 9:
+        bot.log("[配置] 无胜场保险已关闭 (stall=0, 漂到无怪区也不会自动停, 注意观察)")
     # ★ 看门狗 (2026-09-26): 独立分离进程守护本进程,
     #   命令行窗口被关/崩溃时自动对游戏窗口 flush_keys, 防卡键走丢
     try:

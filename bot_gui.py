@@ -67,6 +67,7 @@ class BotGUI:
         self.v_mins = entry(r1, "运行时长/分钟 (0=不限)", 10, "0")
         self.v_r0 = entry(r1, "巡逻半径起", 6, "28")
         self.v_rmax = entry(r1, "巡逻半径上限", 6, "90")
+        self.v_stall = entry(r1, "无胜场保险/分钟 (0=关)", 10, "20")
 
         r2 = ttk.Frame(f); r2.pack(fill="x", pady=(0, 6))
         ttk.Label(r2, text="方向偏置 (优先往该方向探索)").pack(
@@ -140,8 +141,9 @@ class BotGUI:
             mins = max(0, int(self.v_mins.get() or "0"))
             r0 = int(self.v_r0.get() or "28")
             rmax = int(self.v_rmax.get() or "90")
+            stall = max(0, int(self.v_stall.get() or "20"))
         except ValueError:
-            self._err("参数错误", "胜场/时长/半径必须是整数。")
+            self._err("参数错误", "胜场/时长/半径/保险必须是整数。")
             return
         exe = self.v_exe.get().strip() or sys.executable
         if not os.path.exists(exe):
@@ -150,7 +152,7 @@ class BotGUI:
         secs = mins * 60
         args = [exe, "-u", "pal_bot_mem4.py", str(maxb), str(secs),
                 str(r0), str(rmax), self.v_bias.get(),
-                "穿门" if self.v_open.get() else ""]
+                "穿门" if self.v_open.get() else "", str(stall * 60)]
         # 3. 启动
         try:
             self.proc = subprocess.Popen(
