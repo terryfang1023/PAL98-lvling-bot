@@ -24,3 +24,21 @@ __pycache__/
 build/
 dist/
 *.spec
+
+# 内存逆向调试临时产物 (2026-09-29, 结论已沉淀进代码与工具)
+/an?.txt
+/ao.txt
+/bs.txt
+/cmp.txt
+/cur.txt
+/d?.txt
+/dr?.txt
+/ds*.txt
+/ops*.txt
+/ps*.txt
+/sb.txt
+/stat*.txt
+/t5.txt
+/o?.json
+/objects_dump.json
+/scene_info.json

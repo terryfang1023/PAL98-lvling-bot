@@ -79,6 +79,9 @@ class BotGUI:
         self.v_open = tk.BooleanVar(value=False)
         ttk.Checkbutton(r2, text="穿门模式 (不避开传送阵/楼梯, 踩到就去下一层)",
                         variable=self.v_open).pack(side="left", padx=(16, 0))
+        self.v_elem = tk.BooleanVar(value=True)
+        ttk.Checkbutton(r2, text="要素巡回 (直奔怪点刷怪 + 顺路开宝箱)",
+                        variable=self.v_elem).pack(side="left", padx=(16, 0))
 
         r3 = ttk.Frame(f); r3.pack(fill="x", pady=(0, 6))
         self.v_exe = entry(r3, "Python 解释器 (bot 子进程使用)", 46,
@@ -97,6 +100,8 @@ class BotGUI:
                                  state="disabled")
         self.b_kill.pack(side="left", padx=6)
         ttk.Button(f, text="场景体检", command=self.scene_check).pack(
+            side="left", padx=6)
+        ttk.Button(f, text="刷新怪点/宝箱", command=self.refresh_scene_info).pack(
             side="left", padx=6)
         ttk.Button(f, text="检测游戏窗口", command=self.detect_window).pack(
             side="left", padx=6)
@@ -150,9 +155,10 @@ class BotGUI:
             self._err("参数错误", "Python 解释器路径不存在:\n%s" % exe)
             return
         secs = mins * 60
-        args = [exe, "-u", "pal_bot_mem4.py", str(maxb), str(secs),
+        args = [exe, "-u", "pal_bot_mem5.py", str(maxb), str(secs),
                 str(r0), str(rmax), self.v_bias.get(),
-                "穿门" if self.v_open.get() else "", str(stall * 60)]
+                "穿门" if self.v_open.get() else "", str(stall * 60),
+                "" if self.v_elem.get() else "巡逻"]
         # 3. 启动
         try:
             self.proc = subprocess.Popen(
@@ -205,6 +211,26 @@ class BotGUI:
             self.log_line("[体检] %s" % (r.stdout or r.stderr or "(无输出)"))
         except Exception as ex:
             self._err("体检失败", str(ex))
+
+    def refresh_scene_info(self):
+        """从运行中的游戏内存重新导出全图怪点/宝箱清单 (1~2 秒)。"""
+        exe = self.v_exe.get().strip() or sys.executable
+        script = os.path.join(BASE, "tools", "build_scene_info.py")
+        if not os.path.exists(script):
+            self._err("缺少工具", "未找到 tools/build_scene_info.py")
+            return
+        try:
+            r = subprocess.run([exe, script], cwd=BASE, env=ENV_UTF8,
+                               capture_output=True, text=True,
+                               encoding="utf-8", errors="replace", timeout=180)
+        except Exception as ex:
+            self._err("刷新失败", str(ex))
+            return
+        out = ((r.stdout or "") + (r.stderr or "")).strip()
+        self.log_line("[要素] " + (out[-2000:] or "(无输出)"))
+        if r.returncode != 0:
+            self._err("刷新失败",
+                      out[-800:] or "请确认游戏正在运行且已进入存档")
 
     def detect_window(self):
         # ★ 在子进程里检测 (不把 pal_bot 导入 GUI 进程):
