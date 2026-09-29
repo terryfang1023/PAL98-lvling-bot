@@ -12,10 +12,17 @@ import time
 BASE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE)
 
-from pal_bot_mem5 import MemBot5, cheb      # noqa: E402
+from pal_bot_mem5 import MemBot5, cheb, kof      # noqa: E402
 
 OK = []
 BAD = []
+
+
+class FakeObjMem(object):
+    """离线替身: open() 直接失败 -> 走「回退静态坐标」分支。"""
+
+    def open(self):
+        return False
 
 
 def check(name, cond, extra=""):
@@ -43,6 +50,11 @@ def shadow(scene=157):
     o._slog_t = {}
     o.migrate = False
     o.home_active = lambda: False
+    o._objmem = FakeObjMem()
+    o._live_t = 0.0
+    o._live_cache = None
+    o._live_moved = {}
+    o._live_warned = False
     o.stat = {"mon_hit": 0, "mon_visit": 0, "chest_ok": 0, "chest_try": 0,
               "fallback": 0}
     o.logs = []
@@ -64,7 +76,7 @@ CUR = (-28, 120)
 CAND = [(a, b) for a in range(CUR[0] - 70, CUR[0] + 70)
         for b in range(CUR[1] - 70, CUR[1] + 70)]
 
-print("=== 1. 怪点选择: 最近怪点的 1 格邻域 ===")
+print("=== 1. 怪点选择: 最近怪点的正交邻域 ===")
 o = shadow()
 r = o._pick_monster(CUR, CAND)
 check("返回 (走位, 怪点) 二元组", isinstance(r, tuple) and len(r) == 2, str(r))
@@ -72,9 +84,10 @@ t, mk = r
 near = min(o.scene_monsters(), key=lambda m: cheb(tuple(m["K"]), CUR))
 check("挑的是最近的怪点", cheb(mk, tuple(near["K"])) <= 1,
       "怪点%s 最近%s" % (mk, near["K"]))
-check("走位在怪点 1 格内(触发圈)", cheb(t, mk) <= 1, "走位%s 怪点%s" % (t, mk))
-check("走位不是怪点本身(避免被怪挡路)", t != mk or cheb(t, CUR) == 0,
-      "走位%s" % (t,))
+check("★走位在怪点正交邻域(真触发圈, 非斜角)",
+      (t[0] - mk[0], t[1] - mk[1]) in MemBot5.ORTHO_SET, "走位%s 怪点%s" % (t, mk))
+check("走位不是怪点本身时距它正好 1 格",
+      t == mk or abs(t[0] - mk[0]) + abs(t[1] - mk[1]) == 1)
 
 print("\n=== 2. 冷却中的怪点被跳过 ===")
 o.mon_cd[(157,) + mk] = time.time() + 60
@@ -178,6 +191,7 @@ check("无要素数据 -> None", o8c._pick_monster(CUR, CAND) is None
 print("\n=== 9. 日志节流: 同一点 20 秒内只打一条 ===")
 o9 = shadow()
 k = tuple(o9.scene_monsters()[0]["K"])
+o9.logs = []            # 清掉上面取清单时可能打的「实时不可用」提示
 o9._slog(k, "msg1")
 o9._slog(k, "msg2")
 check("同 key 第二条被节流", len(o9.logs) == 1, "logs=%d" % len(o9.logs))
@@ -196,17 +210,53 @@ lst = o10.scene_monsters()
 body = tuple(lst[0]["K"])
 t11 = o10._pick_monster(body, CAND)
 check("不把脚下这只怪当目标",
-      t11 is None or cheb(t11[1], body) > 1,
+      t11 is None or not o10._in_trigger(t11[1], body),
       "选中%s (%d 个怪点)" % (t11[1] if t11 else None, len(lst)))
 
 print("\n=== 12. 常量的自洽性(阈值必须存在且有序) ===")
 for nm in ("MON_CD", "MON_SETTLE_MIN", "MON_GOAL_TTL", "MON_HIT_NEAR",
-           "MON_TRY_N", "MON_MISS_N", "MON_LOG_EVERY"):
+           "MON_TRY_N", "MON_MISS_N", "MON_LOG_EVERY", "CHEST_BIAS"):
     check("常量 %s 已定义" % nm, isinstance(getattr(MemBot5, nm, None),
                                           (int, float)),
           "=%s" % getattr(MemBot5, nm, None))
 check("MON_GOAL_TTL > MON_SETTLE_MIN",
       MemBot5.MON_GOAL_TTL > MemBot5.MON_SETTLE_MIN)
+
+print("\n=== 13. ★ 触发圈几何: 正交算、斜角不算 ===")
+o13 = shadow()
+m0 = tuple(o13.scene_monsters()[0]["K"])
+check("怪点本身在触发圈", o13._in_trigger(m0, m0))
+check("正交邻格(4个)在触发圈",
+      all(o13._in_trigger(m0, (m0[0] + da, m0[1] + db))
+          for da, db in MemBot5.ORTHO))
+check("★斜角格(4个)不在触发圈",
+      not any(o13._in_trigger(m0, (m0[0] + da, m0[1] + db))
+              for da, db in MemBot5.DIAG))
+check("2 格外不在触发圈", not o13._in_trigger(m0, (m0[0] + 2, m0[1])))
+
+print("\n=== 14. ★ 顺路开箱: max_d 限制与无限制 ===")
+o14 = shadow()
+check("max_d=0 -> 不开箱(怪点近时不去)", o14._pick_chest(CUR, CAND, max_d=0)
+      is None)
+tb14 = o14._pick_chest(CUR, CAND, max_d=10 ** 6)
+check("max_d 放开 -> 能选到箱子", tb14 is not None, "站位%s" % (tb14,))
+o14b = shadow()
+check("max_d 过滤时不会误设目标", o14b._pick_chest(CUR, CAND, max_d=0) is None
+      and o14b._chest_goal is None)
+
+print("\n=== 15. ★ 实时怪点坐标: 读不到时安全回退 ===")
+check("kof 换算正确", kof(400, 1480) == (-80, 104), str(kof(400, 1480)))
+o15 = shadow()
+static_n = len(o15.scene_info["157"]["monsters"])
+check("读不到内存 -> 回退静态清单",
+      len(o15.scene_monsters()) == static_n,
+      "实时%d 静态%d" % (len(o15.scene_monsters()), static_n))
+check("跨场景查询仍走静态清单",
+      len(o15.scene_monsters(99999)) == 0)
+o15c = shadow()
+o15c.elem_mode = False
+check("要素模式关闭时不读实时", hasattr(o15c, "_objmem")
+      and o15c.scene_monsters() == o15c.scene_info["157"]["monsters"])
 
 print("\n" + "=" * 56)
 print("通过 %d 项, 失败 %d 项" % (len(OK), len(BAD)))

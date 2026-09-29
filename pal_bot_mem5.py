@@ -35,8 +35,11 @@ SDLPAL 把地图上的怪/NPC/宝箱/传送阵都存成**事件对象**(EVENTOBJ
 启动时缺失会自动尝试生成一次（1~2 秒，不用真的跑遍地图）。
 关闭要素模式（回到纯 v15 行为）: 第 8 个参数写 巡逻 或 off
 """
+import ctypes
+import ctypes.wintypes as _wt
 import json
 import os
+import struct
 import subprocess
 import sys
 import time
@@ -48,11 +51,134 @@ import pal_bot as PB                                          # noqa: E402
 from pal_bot_mem4 import MemBot4                              # noqa: E402
 
 
+# ======================================================================
+#  实时事件对象表访问 (只读)
+# ======================================================================
+# ★ 2026-09-29 实测: 部分怪(spr=495 / 460 等)会在地图上**自动游走**,
+#   静态快照 scene_info.json 的坐标必然失效 —— 实测 K(-74,100) 的怪跑到了
+#   K(-81,105)。bot 走到旧坐标当然「走到 1 格内未触发」, 跨 28 分钟反复出现。
+#   => 怪点坐标必须每次**实时**从内存读。
+#
+# 地址来自 SDLPAL global.h tagGAMEDATA (与 tools/dump_objects.py 同源):
+#   lprgEventObject @0x00C38080 / nEventObject @0x00C38084
+#   rgScene[300]    @0x00C38088 (每场景 8 字节, 第 4 个 WORD = 该场景对象末序号)
+#   wNumScene       @0x00C3C95A
+OBJ_PTR_ADDR = 0x00C38080
+OBJ_N_ADDR = 0x00C38084
+OBJ_SCENE_TAB = 0x00C38088
+OBJ_SCENE_NOW = 0x00C3C95A
+OBJ_MAX_SCENES = 300
+OBJ_SIZE = 32
+PROC_OPEN_OK = 0x0010 | 0x0400
+
+
+def kof(px, py):
+    """地图像素坐标 -> 格坐标 K。"""
+    return ((px - 2 * py) // 32, (px + 2 * py - 32) // 32)
+
+
+def _game_pids():
+    """标题含 'Pal' 的窗口所属进程 pid。
+    注意: ctypes.wintypes 只有**类型**, 库要从 ctypes.windll 取。"""
+    u32 = ctypes.windll.user32
+    res = []
+
+    @ctypes.WINFUNCTYPE(ctypes.c_bool, _wt.HWND, _wt.LPARAM)
+    def cb(hwnd, lp):
+        pid = _wt.DWORD()
+        u32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        n = u32.GetWindowTextLengthW(hwnd)
+        if n:
+            b = ctypes.create_unicode_buffer(n + 1)
+            u32.GetWindowTextW(hwnd, b, n + 1)
+            if "Pal" in b.value:
+                res.append(pid.value)
+        return True
+    u32.EnumWindows(cb, 0)
+    return sorted(set(res))
+
+
+class _ObjMem:
+    """只读的事件对象表访问器(独立于 pal_bot_mem.Mem, 不碰它的句柄)。"""
+
+    def __init__(self):
+        self.k32 = ctypes.windll.kernel32
+        self.h = None
+        self.got = ctypes.c_size_t()
+        self._fail = 0
+
+    def open(self):
+        if self.h:
+            return True
+        try:
+            pids = _game_pids()
+            if not pids:
+                self.err = "找不到标题含 Pal 的窗口"
+                return False
+            self.h = self.k32.OpenProcess(PROC_OPEN_OK, False, pids[0])
+            if not self.h:
+                self.err = "OpenProcess 失败 pid=%d" % pids[0]
+        except Exception as e:
+            self.h = None
+            self.err = "枚举窗口异常: %s" % e
+        return bool(self.h)
+
+    def rd(self, addr, size):
+        buf = (ctypes.c_char * size)()
+        if not self.k32.ReadProcessMemory(self.h, ctypes.c_void_p(addr), buf,
+                                          size, ctypes.byref(self.got)):
+            return None
+        return buf.raw[:self.got.value]
+
+    def u32(self, addr):
+        d = self.rd(addr, 4)
+        return struct.unpack("<I", d)[0] if d and len(d) == 4 else None
+
+    def u16(self, addr):
+        d = self.rd(addr, 2)
+        return struct.unpack("<H", d)[0] if d and len(d) == 2 else None
+
+    def scene_objects(self, s):
+        """返回场景 s 的对象原始字段元组列表(每个 16 个 WORD)。"""
+        ptr = self.u32(OBJ_PTR_ADDR)
+        n = self.u32(OBJ_N_ADDR)
+        if not ptr or not n or n > 6000:
+            return []
+        tab = self.rd(OBJ_SCENE_TAB, OBJ_MAX_SCENES * 8)
+        if not tab or len(tab) < OBJ_MAX_SCENES * 8:
+            return []
+        idxs = [struct.unpack_from("<4H", tab, i * 8)[3]
+                for i in range(OBJ_MAX_SCENES)]
+        lo = idxs[s - 1] + 1                       # 1-based
+        hi = idxs[s] if s < OBJ_MAX_SCENES else n
+        cnt = hi - lo + 1
+        if cnt <= 0 or cnt > 3000:
+            return []
+        raw = self.rd(ptr + (lo - 1) * OBJ_SIZE, cnt * OBJ_SIZE)
+        if not raw or len(raw) < cnt * OBJ_SIZE:
+            return []
+        return [struct.unpack_from("<16H", raw, i * OBJ_SIZE)
+                for i in range(cnt)]
+
+
 def cheb(p, q):
     return max(abs(p[0] - q[0]), abs(p[1] - q[1]))
 
 
 class MemBot5(MemBot4):
+    # ---- 触发圈几何 (2026-09-29 实测修正) ----
+    # ★ 只有「正交 4 邻格」才算进了触发圈。原先的 3x3 邻域含 4 个斜角格,
+    #   站到斜角格上引擎**不触发**战斗(实测: K(-74,104)/K(-74,100) 两个点
+    #   跨 17 分钟反复报「走到 1 格内未触发」, 远超过 45 秒重生期, 排除
+    #   「怪在恢复期」的解释) -> 选站格必须优先正交邻格。
+    ORTHO = ((1, 0), (-1, 0), (0, 1), (0, -1))
+    DIAG = ((1, 1), (1, -1), (-1, 1), (-1, -1))
+    ORTHO_SET = set(ORTHO) | {(0, 0)}
+
+    def _in_trigger(self, mk, cur):
+        """队伍是否真的站进了怪点的触发圈(正交 1 格内, 含怪点本身)。"""
+        return (cur[0] - mk[0], cur[1] - mk[1]) in self.ORTHO_SET
+
     # ---- 怪点巡回参数 ----
     MON_CD = 70.0           # 打过之后该怪点的冷却(怪隐藏~800帧≈45s, 留余量)
     MON_SETTLE_MIN = 1.5    # 到了目标点后至少站这么久才判「有没有开打」
@@ -65,12 +191,19 @@ class MemBot5(MemBot4):
                             # 绕行知识更新后可能就通了
     MON_LOG_EVERY = 15      # 每 N 次选点打一条日志
     SLOG_GAP = 20.0         # 同一怪点的日志最小间隔
+    LIVE_TTL = 2.0          # 实时怪点坐标缓存时长(闹钟式重读内存, 很便宜)
+    ELEM_NEAR_D = 18        # 就近优先半径: 有 ≤N 格的怪点就绝不长途跋涉
+                            #   (锁妖塔窄桥区长途 BFS 极易"实测被挡", 吞吐掉到 0.2)
+                            #   近处全没有时才退而选最近的(不硬排除)
 
     # ---- 宝箱参数 ----
     CHEST_TRY_N = 4         # 同一个箱子试 N 次没反应 -> 放弃
     CHEST_CD = 240.0        # 试失败后的冷却
     CHEST_SETTLE = 0.55     # 转身后等待时间(转身动画)
     CHEST_DLG_WAIT = 0.80   # 按空格后等对话框弹出
+    CHEST_BIAS = 0.60       # ★顺路开箱: 宝箱距离 < 最近怪点距离×此系数就去开
+                            #   否则「怪点永远有候选」(21个点/70s冷却)会让宝箱
+                            #   一次都轮不到(三轮实测 0 次尝试)
 
     def __init__(self, *a, **kw):
         super().__init__(*a, **kw)
@@ -90,6 +223,11 @@ class MemBot5(MemBot4):
         self._elem_t = 0.0
         self._slog_t = {}         # 怪点日志节流
         self._nearest_hint = None
+        self._objmem = _ObjMem()
+        self._live_t = 0.0
+        self._live_cache = None
+        self._live_moved = {}     # (scene,静态K) -> 实时K, 只用于日志提示
+        self._live_warned = False
         self.stat = {"mon_hit": 0, "mon_visit": 0, "chest_ok": 0,
                      "chest_try": 0, "fallback": 0}
         self._load_scene_info()
@@ -129,8 +267,81 @@ class MemBot5(MemBot4):
                  % (len(self.scene_info), nm, nc))
 
     def scene_monsters(self, sc=None):
+        """当前场景的怪点清单。
+
+        ★ 优先**实时**从内存读真实坐标(怪会游走, 静态快照必然过期);
+        读不到时退回 scene_info.json 的静态坐标。
+        """
         sc = self.scene if sc is None else sc
+        if sc == self.scene and getattr(self, "elem_mode", False):
+            return self._live_monsters()
         return (self.scene_info.get(str(sc)) or {}).get("monsters") or []
+
+    def _live_monsters(self):
+        now = time.time()
+        if self._live_cache is not None and now - self._live_t < self.LIVE_TTL:
+            return self._live_cache
+        self._live_t = now
+        self._live_cache = self._read_live_monsters()
+        return self._live_cache
+
+    def _read_live_monsters(self):
+        """实时读当前场景的怪点。
+
+        判定: 对象的 wTriggerScript ∈ 静态清单里怪点的触发脚本集合
+              (用 trig 而不是坐标做身份, 因为坐标会变)
+              且 wSpriteNum != 0 且 sState == 2 (2 = 正常在场; 被打掉是 -2)。
+        """
+        static = (self.scene_info.get(str(self.scene)) or {}).get("monsters") or []
+        if not static:
+            return []
+        wl = set(m.get("trig", 0) for m in static)
+        wl.discard(0)
+        if not wl:
+            return list(static)
+        if not self._objmem.open():
+            if not self._live_warned:
+                self._live_warned = True
+                self.log("[怪点] 实时坐标不可用(%s) -> 退回静态快照"
+                         % getattr(self._objmem, "err", "?"))
+            return list(static)
+        try:
+            objs = self._objmem.scene_objects(self.scene)
+        except Exception:
+            return list(static)
+        if not objs:
+            return list(static)
+        out = []
+        moved = 0
+        for f in objs:
+            spr, trig, state, mode = f[8], f[4], f[6], f[7]
+            if not spr or trig not in wl or state != 2:
+                continue
+            a, b = kof(f[1], f[2])
+            out.append({"K": [a, b], "spr": spr, "mode": mode, "state": state,
+                        "trig": trig, "auto": f[5], "chase": True})
+        if not out:
+            # 全都在恢复期(或读歪了): 交回静态坐标, 让冷却机制照常工作
+            return list(static)
+        # 只做一次「坐标漂移」提示, 方便确认实时读取生效
+        if not self._live_moved:
+            for m in static:
+                k = tuple(m["K"])
+                for o in out:
+                    if o["trig"] == m.get("trig") and o["spr"] == m.get("spr"):
+                        if cheb(k, tuple(o["K"])) > 2:
+                            self._live_moved[k] = tuple(o["K"])
+                        break
+            if self._live_moved:
+                k0 = next(iter(self._live_moved))
+                self.log("[怪点] ★实时坐标生效: 场景%d 有 %d 个怪点已游走 "
+                         "(例: 静态%s -> 实时%s); 本场景实时怪点 %d 个"
+                         % (self.scene, len(self._live_moved), k0,
+                            self._live_moved[k0], len(out)))
+            else:
+                self.log("[怪点] ★实时坐标生效: 场景%d 实时怪点 %d 个 "
+                         "(与静态快照一致)" % (self.scene, len(out)))
+        return out
 
     def scene_chests(self, sc=None):
         sc = self.scene if sc is None else sc
@@ -171,6 +382,12 @@ class MemBot5(MemBot4):
         r = self._pick_monster(cur, cand)
         if r is not None:
             t, mk = r
+            # ★ 顺路开箱: 明显比怪点近的宝箱先开掉, 否则怪点永远有候选,
+            #   宝箱一次都轮不到
+            tc = self._pick_chest(cur, cand,
+                                  max_d=cheb(t, cur) * self.CHEST_BIAS)
+            if tc is not None:
+                return tc
             self._mon_goal = (self.scene, t, mk, time.time())
             return t
         t = self._pick_chest(cur, cand)
@@ -190,8 +407,7 @@ class MemBot5(MemBot4):
             return None
         now = time.time()
         rset = set(cand)
-        best = None
-        bd = 10 ** 9
+        cands = []                  # (距离, 站格, 怪点)
         n_cd = 0
         n_in = 0
         for m in lst:
@@ -202,33 +418,43 @@ class MemBot5(MemBot4):
             if now < self.mon_cd.get(key, 0):
                 n_cd += 1
                 continue
-            if cheb(k, cur) <= 1:
+            if self._in_trigger(k, cur):
                 n_in += 1          # 已经在触发圈里 -> 不是"要去"的目标
                 continue
-            # 优先站到怪点周围 1 格(触发范围就是 1 格), 这样不会被怪自身的
-            # 对象碰撞挡在目标格上 -> 避免误记"实测被挡"把怪点格永久封掉
-            alts = [c for c in ((k[0] + da, k[1] + db)
-                                for da in (-1, 0, 1) for db in (-1, 0, 1))
-                    if c in rset]
-            if alts:
-                kk = min(alts, key=lambda c: cheb(c, cur))
+            # ★ 优先站到怪点的「正交」1 格邻格(才是真触发范围), 斜角格只是
+            #   备选 —— 斜角站位引擎不触发, 会白白浪费一次往返
+            alts_o = [c for c in ((k[0] + da, k[1] + db) for da, db in self.ORTHO)
+                      if c in rset]
+            alts_d = [c for c in ((k[0] + da, k[1] + db) for da, db in self.DIAG)
+                      if c in rset]
+            if alts_o:
+                kk = min(alts_o, key=lambda c: cheb(c, cur))
+            elif alts_d:
+                kk = min(alts_d, key=lambda c: cheb(c, cur))
             elif k in rset:
                 kk = k
             else:
                 continue
-            d = cheb(kk, cur)
-            if d < bd:
-                bd, best = d, (kk, k)
+            cands.append((cheb(kk, cur), kk, k))
         self._pick_n5 += 1
-        if best is not None and self._pick_n5 % self.MON_LOG_EVERY == 0:
+        if not cands:
+            return None
+        # ★ 就近优先: 有 ≤ELEM_NEAR_D 格的就绝不去远的
+        near = [c for c in cands if c[0] <= self.ELEM_NEAR_D]
+        bd, kk, k = min(near if near else cands, key=lambda c: c[0])
+        best = (kk, k)
+        if self._pick_n5 % self.MON_LOG_EVERY == 0:
             self.log("[怪点] 目标 K%s -> 怪 K%s (距 %d 格; 本场景 %d 个怪点, "
                      "冷却 %d, 圈内 %d, 已弃 %d)"
                      % (best[0], best[1], bd, len(lst), n_cd, n_in,
                         sum(1 for x in self.mon_dead if x[0] == self.scene)))
         return best
 
-    def _pick_chest(self, cur, cand):
-        """未开的宝箱 -> 挑一个可站的相邻格; 同时记住朝向。"""
+    def _pick_chest(self, cur, cand, max_d=None):
+        """未开的宝箱 -> 挑一个可站的相邻格; 同时记住朝向。
+
+        max_d 不为 None 时只考虑距离不超过它的箱子(用于「顺路开箱」)。
+        """
         lst = self.scene_chests()
         if not lst:
             return None
@@ -251,6 +477,8 @@ class MemBot5(MemBot4):
                 kd = {(1, 0): "down", (-1, 0): "up",
                       (0, -1): "right", (0, 1): "left"}[(da, db)]
                 d = cheb(s, cur)
+                if max_d is not None and d > max_d:
+                    continue
                 if d < bd:
                     bd, best, info = d, s, (k, kd)
         if best is not None:
@@ -284,8 +512,12 @@ class MemBot5(MemBot4):
             return
         age = time.time() - ts
         key = (sc, mk[0], mk[1])
-        if cheb(mk, cur) > 1:
-            if age < self._goal_ttl(mk, cur):
+        if not self._in_trigger(mk, cur):
+            # 站在斜角格上(cheb=1 但不触发) -> 目标选得不好, 短超时就重选,
+            # 别按完整 TTL 干等
+            diag_stuck = cheb(mk, cur) <= 1
+            ttl = 8.0 if diag_stuck else self._goal_ttl(mk, cur)
+            if age < ttl:
                 return                   # ① 还在路上, 别打扰
             n = self._mon_miss.get(key, 0) + 1      # ② 超时没走到
             self._mon_miss[key] = n
@@ -296,6 +528,9 @@ class MemBot5(MemBot4):
                 self._slog(key, "[怪点] K%s 连续 %d 次超时(%.0fs/次)都没走到 "
                            "-> 冷却 %d 分钟 (BFS 假通路/可能在别的层)"
                            % (mk, n, age, self.MON_MISS_CD // 60))
+            elif diag_stuck:
+                self._slog(key, "[怪点] K%s 只走到斜角格(不触发) -> 重新选站位"
+                           % (mk,))
             return
         if age < self.MON_SETTLE_MIN:
             return                       # ③ 刚踏进触发圈, 等一会儿看是否开打
@@ -477,9 +712,9 @@ if __name__ == "__main__":
             sys.exit(0)
     maxb = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1] != "0" else None
     secs = int(sys.argv[2]) if len(sys.argv) > 2 else None
-    if len(sys.argv) > 3:
+    if len(sys.argv) > 3 and sys.argv[3].strip():
         MemBot4.PATROL_R0 = int(sys.argv[3])
-    if len(sys.argv) > 4:
+    if len(sys.argv) > 4 and sys.argv[4].strip():
         MemBot4.PATROL_RMAX = int(sys.argv[4])
     stall = 1200
     if len(sys.argv) > 7 and sys.argv[7].strip():

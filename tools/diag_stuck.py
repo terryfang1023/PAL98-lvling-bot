@@ -5,7 +5,7 @@ import sys
 
 import numpy as np
 
-BASE = os.path.dirname(os.path.abspath(__file__))
+BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(BASE)
 sys.path.insert(0, BASE)
 
