@@ -336,10 +336,14 @@ class MemBot4(MemBot3):
         cands = [c for c in reach if c not in ban and c != cur and c != exclude]
         if not cands:
             if self.blocked:
+                perm = [c for c in list(self.blocked) if self._is_perm(c)]
                 n = len(self.blocked)
-                self.blocked.clear()
+                for c in list(self.blocked):
+                    if not self._is_perm(c):
+                        self.blocked.discard(c)
                 self._pc_key = None
-                self.log("[自愈] 全图候选为空 -> 清空 %d 条「被挡」重挑" % n)
+                self.log("[自愈] 全图候选为空 -> 清空 %d 条「被挡」重挑 (保留 %d 条长期禁入)"
+                         % (n - len(perm), len(perm)))
                 ban, reach = self.plan_ctx(cur)
                 cands = [c for c in reach
                          if c not in ban and c != cur and c != exclude]

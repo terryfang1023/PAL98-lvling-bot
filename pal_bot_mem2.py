@@ -546,6 +546,8 @@ class MemBot2(V12.MemBot):
                 cleared = 0
                 for c in list(self.blocked):
                     if max(abs(c[0] - cur[0]), abs(c[1] - cur[1])) <= 20:
+                        if self._is_perm(c):
+                            continue          # 长期禁入格 (反复实测被挡) 不参与自愈
                         self.blocked.discard(c)
                         cleared += 1
                 if cleared:
@@ -601,11 +603,16 @@ class MemBot2(V12.MemBot):
                  and max(abs(c[0] - anchor[0]), abs(c[1] - anchor[1])) <= self.RADIUS]
         if not cands:
             # 兜底: 绕行知识把当前格糊死 -> 全部清掉重挑一次
+            #   (长期禁入格保留: 那是反复实测确认的硬阻挡, 清了只会再撞)
             if self.blocked:
+                perm = [c for c in list(self.blocked) if self._is_perm(c)]
                 n = len(self.blocked)
-                self.blocked.clear()
+                for c in list(self.blocked):
+                    if not self._is_perm(c):
+                        self.blocked.discard(c)
                 self._pc_key = None
-                self.log("[自愈] 候选集为空 -> 清空全部 %d 条「被挡」记录重挑" % n)
+                self.log("[自愈] 候选集为空 -> 清空 %d 条「被挡」记录重挑 (保留 %d 条长期禁入)"
+                         % (n - len(perm), len(perm)))
                 ban, reach = self.plan_ctx(cur)
                 cands = [c for c in reach if c not in ban
                          and max(abs(c[0] - anchor[0]),

@@ -167,12 +167,50 @@ class MemBot:
             s = set()
             for x in range(64):
                 for y in range(128):
+                    if x < 5 or x > 57 or y < 7:
+                        # ★ 引擎移动判定自带边界检查 (game.c fCheckRange):
+                        #   x < partyoffset.x/32(5) 或 x >= 64-5-1 或 y < 112/16(7)
+                        #   一律视为阻挡。这些格子数据说可走但引擎必挡,
+                        #   不排除会让 BFS 规划出永远走不进去的边缘路。
+                        continue
                     row = grid[y, x]
                     for hh in (0, 1):
                         if not row[hh]:
                             s.add((x - y, x + y - 1 + hh))
             self._kwalk_cache[m] = s
         return self._kwalk_cache[m]
+
+    ESCALATE_AFTER = 3           # 同一格短窗口内被挡 N 次 -> 升级长期禁入
+    ESCALATE_WINDOW = 600.0      # 升级计数窗口 (秒); 超窗重新计数, 防误封游走NPC路过格
+    ESCALATE_TTL = 1800.0        # 长期禁入持续时间 (秒), 到期自动解除
+
+    def _ban_escalate(self, cell):
+        """被挡升级: 同一格 10 分钟内被挡 3 次, 多为 NPC/怪等持久阻挡物,
+        升级为长期禁入 (把 AgedSet 时间戳推到未来, 绕过 TTL 与孤岛自愈,
+        30 分钟后自动解除 —— 临时阻挡物走后地图自动复原)。"""
+        hits = getattr(self, "blocked_hits", None)
+        if hits is None or not hasattr(self.blocked, "ts"):
+            return
+        now = time.time()
+        cnt, last = hits.get(cell, (0, 0.0))
+        if now - last > self.ESCALATE_WINDOW:
+            cnt = 0
+        cnt += 1
+        hits[cell] = (cnt, now)
+        if cnt >= self.ESCALATE_AFTER and self.blocked.ts.get(cell, 0) < now + 60:
+            if cell not in self.blocked:
+                self.blocked.add(cell)
+            self.blocked.ts[cell] = now + self.ESCALATE_TTL
+            self._pc_key = None
+            self.log("[绕行] K%s %d 分钟内被挡 %d 次 -> 长期禁入 %.0f 分钟"
+                     " (多为 NPC/怪挡路)"
+                     % (cell, self.ESCALATE_WINDOW // 60, cnt,
+                        self.ESCALATE_TTL // 60))
+
+    def _is_perm(self, cell):
+        """该格是否处于"长期禁入"状态 (时间戳被推到远期)。"""
+        ts = getattr(self.blocked, "ts", None)
+        return bool(ts) and ts.get(cell, 0) > time.time() + 60
 
     def enter_scene(self, sc, why=""):
         self.scene = sc
@@ -187,12 +225,13 @@ class MemBot:
                     for ub in (-2, -1, 0, 1, 2):
                         doors.add((da + ua, db + ub))
             st = {"doors": doors, "blocked": set(), "visited": set(),
-                  "startK": cur, "warned": False}
+                  "startK": cur, "warned": False, "blocked_hits": {}}
             self.scene_know[sc] = st
         self.doors = st["doors"]
         self.blocked = st["blocked"]
         self.visited = st["visited"]
         self.startK = st["startK"]
+        self.blocked_hits = st.setdefault("blocked_hits", {})
         ks = self.kwalk(self.map) if self.map is not None else set()
         ok = cur in ks
         self.log("[MEM] 场景%d 地图%s(报告%s) K%s 门禁%d格 可走域%d格 落点可走=%s %s"
@@ -332,6 +371,7 @@ class MemBot:
                         return False
                     if time.time() - getattr(self, "_last_move_t", 0) < 90:
                         self.blocked.add(path[i])
+                        self._ban_escalate(path[i])
                     self.log("[MEM] 实测被挡(数据说可走): %s -> 记入绕行" % (path[i],))
                 return False
             self.visited.add(K1)
