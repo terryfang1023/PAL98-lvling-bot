@@ -5,7 +5,8 @@
     python bot_gui.py             # 打开界面
     python bot_gui.py --selftest  # 自检 (不开窗口, 供 CI/排障用)
 
-界面即参数面板: 选好参数点"开始"即启动 pal_bot_mem4.py 子进程;
+界面即参数面板: 选好参数点"开始"即启动 pal_bot_mem5.py 子进程 (v16 要素巡回:
+直奔怪点刷怪 + 顺路开宝箱; 取消勾选"要素巡回"则退回 v15 渐进巡逻);
 "停止"写入 mem_stop.flag (优雅停机, 清键退出), "强制停止"杀进程并冲洗按键。
 """
 import os
@@ -41,6 +42,7 @@ class BotGUI:
         self.proc = None                 # bot 子进程
         self.q = queue.Queue()           # 子进程日志队列
         self.wins = 0                    # 解析出的胜场
+        self.elem = (0, 0, 0)            # (怪点命中, 走到没打, 开箱成功)
         self.t_start = None
 
         self._build_params()
@@ -171,6 +173,7 @@ class BotGUI:
             return
         self._set_buttons(True)              # 先切按钮状态, 后续任何异常不影响
         self.wins = 0
+        self.elem = (0, 0, 0)
         self.t_start = time.time()
         threading.Thread(target=self._reader, daemon=True).start()
         self.log_line("[GUI] 已启动: %s" % " ".join(args[1:]))
@@ -309,15 +312,26 @@ class BotGUI:
                 m = re.search(r"战斗结束\]\s*#(\d+)", line)
                 if m:
                     self.wins = max(self.wins, int(m.group(1)))
+                m = re.search(r"\[要素\]\s*怪点命中\s*(\d+)\s*/", line)
+                if m:
+                    visit = re.search(r"走到没打\s*(\d+)", line)
+                    box = re.search(r"开箱\s*(\d+)", line)
+                    self.elem = (int(m.group(1)),
+                                 int(visit.group(1)) if visit else 0,
+                                 int(box.group(1)) if box else 0)
                 self.log_line(line)
         except queue.Empty:
             pass
         # 状态栏
         if self._running():
             el = int(time.time() - self.t_start) if self.t_start else 0
-            self.v_status.set("运行中 %02d:%02d:%02d | 胜场 %d"
+            hit, miss, box = self.elem
+            extra = ""
+            if hit or miss or box:
+                extra = " | 怪点命中 %d (走到没打 %d) | 开箱 %d" % (hit, miss, box)
+            self.v_status.set("运行中 %02d:%02d:%02d | 胜场 %d%s"
                               % (el // 3600, el // 60 % 60, el % 60,
-                                 self.wins))
+                                 self.wins, extra))
         self.root.after(250, self._poll)
 
     def _set_buttons(self, running):
@@ -362,8 +376,8 @@ def selftest():
     missing = [n for n in REQUIRED_DATA
                if not os.path.exists(os.path.join(BASE, n))]
     print("SELFTEST 数据文件缺失:", missing or "无")
-    args = [sys.executable, "-u", "pal_bot_mem4.py", "0", "3600", "28",
-            "90", "右上", "穿门"]
+    args = [sys.executable, "-u", "pal_bot_mem5.py", "0", "3600", "28",
+            "90", "右上", "穿门", "1200", ""]
     print("SELFTEST 示例命令行:", " ".join(args))
     print("SELFTEST 停止标志:", STOP_FLAG)
     print("SELFTEST OK")
