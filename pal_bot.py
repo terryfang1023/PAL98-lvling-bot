@@ -5,16 +5,17 @@
 用法:
     python pal_bot.py                    # 无限练级（小范围巡逻）
     python pal_bot.py 20                 # 打 20 场后停止
-    python pal_bot.py 99 left 60         # 往左导航最多60秒（遇敌自动用F打）
+    python pal_bot.py 99 left 60         # 往左导航最多60秒（遇敌自动打）
 
 v3.1 变更:
-    - 战斗中一路按 F = 最强法术; MP不足游戏会自动改用普攻（游戏内置行为，用户确认），
+    - 战斗中一路按「战斗攻击键」(默认 R, 可在 GUI 调; 见 botcfg.py);
+      MP不足游戏会自动改用普攻（游戏内置行为，用户确认），
       无需任何检测回退逻辑
     - 支持导航模式: 指定单一方向 + 时限, 用于把队伍带回黑水镇
 
 原理:
     - PostMessage 后台按键注入 + PrintWindow 后台画面识别, 游戏无需在前台
-    - 战斗中: 按 F 放最强法术
+    - 战斗中: 按「战斗攻击键」重复出手
     - 地图上: 巡逻走动触发随机遇敌（怪物"刷新" = 继续走动即可再遇敌）
     - 防抖: 连续多次确认非战斗画面才算脱战
 
@@ -52,13 +53,88 @@ KEYS = {
     "right": (0x27, 0x4D, True), "left": (0x25, 0x4B, True),
     "up": (0x26, 0x48, True), "down": (0x28, 0x50, True),
     "space": (0x20, 0x39, False), "esc": (0x1B, 0x01, False),
-    "f": (0x46, 0x21, False),
-    # SDLPAL 默认战斗热键 (input.c): A=自动战斗 D=防御 F=重复 Q=逃跑 W=使用物品 E=掷物品
+    "r": (0x52, 0x13, False),   # ★ SDLPAL: kKeyRepeat (重复上次行动)
+    "f": (0x46, 0x21, False),   # SDLPAL: kKeyForce (法术) —— 旧版误当作"重复"
+    # SDLPAL 默认战斗热键 (input.c 的 g_KeyMap, 2026-10-01 核对源码):
+    #   A=自动战斗  D=防御  E=使用物品  W=掷物品  Q=逃跑  R=重复上次行动  S=状态
+    #   ⚠️ 旧注释写的 "F=重复 / W=使用物品 / E=掷物品" 是错的 (F 是法术)
     "a": (0x41, 0x1E, False), "d": (0x44, 0x20, False),
     "q": (0x51, 0x10, False), "w": (0x57, 0x11, False),
     "e": (0x45, 0x12, False),
     "enter": (0x0D, 0x1C, False),
 }
+
+# 单字母/单数字 -> 扫描码兜底表 (PC 键盘 Set 1)。
+# 作用: 用户可以把攻击键随手改成任意字母, 不必先来 KEYS 里登记一行。
+_LETTER_SC = {
+    "a": 0x1E, "b": 0x30, "c": 0x2E, "d": 0x20, "e": 0x12, "f": 0x21,
+    "g": 0x22, "h": 0x23, "i": 0x17, "j": 0x24, "k": 0x25, "l": 0x26,
+    "m": 0x32, "n": 0x31, "o": 0x18, "p": 0x19, "q": 0x10, "r": 0x13,
+    "s": 0x1F, "t": 0x14, "u": 0x16, "v": 0x2F, "w": 0x11, "x": 0x2D,
+    "y": 0x15, "z": 0x2C,
+    "1": 0x02, "2": 0x03, "3": 0x04, "4": 0x05, "5": 0x06, "6": 0x07,
+    "7": 0x08, "8": 0x09, "9": 0x0A, "0": 0x0B,
+}
+
+
+def key_spec(name):
+    """把按键名解析成 (VK, 扫描码, 是否扩展键)。未知名字抛 ValueError。
+
+    查找顺序: KEYS 具名键 -> 单字母/单数字兜底表。
+    """
+    if name in KEYS:
+        return KEYS[name]
+    n = str(name if name is not None else "").strip().lower()
+    if len(n) == 1 and n in _LETTER_SC:
+        return (ord(n.upper()), _LETTER_SC[n], False)
+    raise ValueError("未知按键: %r (可用: 单个字母/数字, 或 %s)"
+                     % (name, "/".join(sorted(KEYS))))
+
+
+def known_keys():
+    """全部可用的按键名 (给 GUI 下拉/排障用)。"""
+    return sorted(set(KEYS) | set(_LETTER_SC))
+
+
+# ----------------------------------------------------------------------
+# 战斗攻击键 (可在 GUI 调, 见 botcfg.py / bot_config.json)
+# ----------------------------------------------------------------------
+# 挂机时 bot 在战斗里反复按的就是这一个键, 所以它是"跟游戏版本/地图走"的
+# 用户设置, 不能写死。默认 R = SDLPAL 官方的 kKeyRepeat(重复上次行动)。
+ATTACK_KEY_DEFAULT = "r"
+ATTACK_KEY = ATTACK_KEY_DEFAULT
+ATTACK_KEY_LEGACY = "f"     # 旧版写死的攻击键: flush_keys 里一并清, 防残留卡键
+
+
+def set_attack_key(name):
+    """设置战斗攻击键 (返回规范化后的键名)。非法按键抛 ValueError。"""
+    global ATTACK_KEY
+    n = str(name if name is not None else "").strip().lower()
+    key_spec(n)                      # 校验: 解析不出就不要改, 保持可用状态
+    ATTACK_KEY = n
+    return n
+
+
+def attack_key():
+    """当前战斗攻击键。"""
+    return ATTACK_KEY
+
+
+def init_attack_key(path=None):
+    """启动时装载攻击键: 环境变量 > bot_config.json > 默认值。
+
+    返回 (键名, 来源说明)。配置里是垃圾值也不抛异常 —— 回退默认键并
+    在来源里写清原因, 机器人照常能跑。
+    """
+    try:
+        import botcfg
+        val, src = botcfg.resolve("attack_key", path)
+        return set_attack_key(val), src
+    except ValueError as e:
+        return (set_attack_key(ATTACK_KEY_DEFAULT),
+                "默认值 (配置里的 %r 无效: %s)" % (path, e))
+    except Exception as e:               # botcfg 缺失/读挂 -> 也不许拖垮启动
+        return set_attack_key(ATTACK_KEY_DEFAULT), "默认值 (%s)" % e
 
 # ---- 格子制移动参数 (实测标定: 窗口1687x1294, 缩放5.27x) ----
 # 短按 0.09s = 精确走 1 格; 一格场景滚动 = (±83, ±42) 像素
@@ -95,20 +171,142 @@ def find_game_window():
     return found
 
 
+def list_pal_windows():
+    """列出全部"标题含 Pal"的窗口 (不区分大小写): [(hwnd, 标题)]。
+    排障用: 换 exe / 多开时先看清楚有几个候选。
+
+    ★ 2026-10-01: 排除自家 GUI (标题「仙剑98 挂机机器人 (SDLPAL)」) ——
+      它也含 "pal", 之前会被 tools/* 当成游戏窗口列出来, 误导排查
+      (battle_probe 曾经把 GUI 截了一帧还报"普通地图画面")。
+    """
+    out = []
+
+    def cb(hwnd, _):
+        if win32gui.IsWindowVisible(hwnd):
+            t = win32gui.GetWindowText(hwnd)
+            if t and "pal" in t.lower() and "挂机机器人" not in t:
+                out.append((hwnd, t))
+
+    win32gui.EnumWindows(cb, None)
+    return out
+
+
 class Game:
     def __init__(self, hwnd):
         self.hwnd = hwnd
+        self._geo = None
+        self._geo_t = 0.0
+
+    # ------------------------------------------------------------------
+    #  几何自标定 (v17.2): 窗口被手动缩放后, 像素级常量必须跟着换算
+    #  见 wingeom.py 的说明; 环境变量 PAL_GEOM=off 可强制回到旧常量
+    # ------------------------------------------------------------------
+    def geom(self, refresh=False):
+        """实测窗口几何 (带缓存)。失败/被禁用 -> 标定几何 (行为与旧版一致)。"""
+        import wingeom
+        if os.environ.get("PAL_GEOM", "").lower() in ("off", "0", "legacy"):
+            self._geo = wingeom.legacy()
+            return self._geo
+        if self._geo is not None and not refresh:
+            return self._geo
+        try:
+            l, t, r, b = win32gui.GetWindowRect(self.hwnd)
+            win = (r - l, b - t)
+            if win == wingeom.REF_WIN:
+                # ★ 零回归通道: 窗口尺寸与标定一致 -> 直接用标定常量
+                #   (不截图、不换算, 行为与旧版逐位相同)
+                geo = wingeom.legacy("窗口尺寸与标定一致 -> 沿用标定常量")
+            else:
+                cr = win32gui.GetClientRect(self.hwnd)
+                pt = win32gui.ClientToScreen(self.hwnd, (0, 0))
+                coff = (pt[0] - l, pt[1] - t)
+                csize = (cr[2], cr[3])
+                rowmax = colmax = None
+                try:
+                    a = self.shot()             # 量视口矩形 (85ms, 只做一次)
+                    # ★ 必须裁到客户区再量 (v17.2): 抓帧覆盖整个窗口外框,
+                    #   标题栏那一行很亮 -> 逐列最大值在**每一列**都被抬到 240+,
+                    #   于是逐列量不出黑边 -> 误判"画面铺满整宽"。
+                    #   实测 1653x1121 窗口曾量出 (0,0,1653,1090) 这种错矩形。
+                    cx = max(0, min(int(coff[0]), max(0, a.shape[1] - 1)))
+                    cy = max(0, min(int(coff[1]), max(0, a.shape[0] - 1)))
+                    sub = a[cy:cy + int(csize[1]), cx:cx + int(csize[0])]
+                    if sub.shape[0] >= 40 and sub.shape[1] >= 40:
+                        rowmax = sub.max(axis=(1, 2))
+                        colmax = sub.max(axis=(0, 2))
+                except Exception:
+                    rowmax = colmax = None
+                geo = wingeom.choose(win, coff, csize,
+                                     rowmax=rowmax, colmax=colmax,
+                                     measure_off=coff)
+            self._geo = geo
+            self._apply_geo(geo)
+        except Exception:
+            self._geo = wingeom.legacy("几何探测异常 -> 退回标定常量")
+        self._geo_t = time.time()
+        return self._geo
+
+    def _apply_geo(self, geo):
+        """把模块级像素常量按实测几何就地更新。
+
+        标定几何下 wingeom 保证取值逐位一致 -> 不改变既有行为;
+        窗口被缩放时才真正生效 (v3 独立模式 pal_bot.py 仍然引用这些全局名,
+        就地更新可以避免"改名漏改点"这类隐患)。
+        """
+        import wingeom as WG
+        g = globals()
+        g["PATCH"] = WG.patch(geo)
+        g["TILE_DX"] = WG.dx_px(geo, WG.N_TILE_X)
+        g["TILE_DY"] = WG.dy_px(geo, WG.N_TILE_Y)
+        g["TILE_MAG"] = (TILE_DX ** 2 + TILE_DY ** 2) ** 0.5
+        Game.FCAPW, Game.FCAPH = WG.fcap(geo)      # 类属性 (shot_fast 用它抓帧)
+        for _a in ("_f_bmp", "_f_dc", "_f_mfc", "_f_save"):
+            self.__dict__.pop(_a, None)            # 抓帧位图尺寸变了 -> 下次重建
+        try:
+            PBcls = g.get("PalBot")
+            if PBcls is not None:
+                PBcls.BOX = WG.box(geo)
+                PBcls.EXPECTED = {"up": (-TILE_DX, TILE_DY),
+                                  "down": (TILE_DX, -TILE_DY),
+                                  "right": (-TILE_DX, -TILE_DY),
+                                  "left": (TILE_DX, TILE_DY)}
+        except Exception:
+            pass
+
+    def geom_if_changed(self):
+        """窗口尺寸没变就用缓存; 变了 (用户拖了边框) 就重新标定。"""
+        import wingeom
+        if self._geo is None:
+            return self.geom(refresh=True)
+        try:
+            l, t, r, b = win32gui.GetWindowRect(self.hwnd)
+            if (r - l, b - t) != tuple(self._geo["win"]):
+                return self.geom(refresh=True)
+        except Exception:
+            pass
+        return self._geo
 
     def flush_keys(self):
         """冲洗所有方向键的keyup, 清除游戏内可能卡死的方向标志"""
-        for name in ["up", "down", "left", "right", "space", "esc", "f"]:
-            vk, sc, ext = KEYS[name]
+        names = ["up", "down", "left", "right", "space", "esc", ATTACK_KEY]
+        if ATTACK_KEY_LEGACY not in names:      # 兼容: 旧版攻击键也一并清掉
+            names.append(ATTACK_KEY_LEGACY)
+        for name in names:
+            vk, sc, ext = key_spec(name)
             kup = 1 | (sc << 16) | ((1 << 24) if ext else 0) | (1 << 30) | (1 << 31)
             win32api.PostMessage(self.hwnd, WM_KEYUP, vk, kup)
         time.sleep(0.05)
 
+    def attack(self, dur=0.07):
+        """按一下"战斗攻击键" (可在 GUI 调, 默认 R)。
+
+        战斗里所有"重复出手"的地方都必须走这里, 不要写死具体按键 ——
+        换地图/换版本后按键会变。
+        """
+        self.key(ATTACK_KEY, dur)
+
     def key(self, name, dur=0.07):
-        vk, sc, ext = KEYS[name]
+        vk, sc, ext = key_spec(name)
         lp = 1 | (sc << 16) | ((1 << 24) if ext else 0)
         kup = lp | (1 << 30) | (1 << 31)
         # 防丢键三保险: 先补keyup(清卡键) -> keydown -> keyup -> 再补keyup
@@ -121,7 +319,7 @@ class Game:
         win32api.PostMessage(self.hwnd, WM_KEYUP, vk, kup)
 
     def hold(self, name, dur):
-        vk, sc, ext = KEYS[name]
+        vk, sc, ext = key_spec(name)
         lp = 1 | (sc << 16) | ((1 << 24) if ext else 0)
         win32api.PostMessage(self.hwnd, WM_KEYDOWN, vk, lp)
         time.sleep(dur)
@@ -130,7 +328,7 @@ class Game:
     def tap(self, name, dur=0.09):
         """极简点按(热路径专用): 先补 keyup 再立刻 keydown, 不做额外等待。
         实测每格省 0.06 秒(全流程 0.27s -> 0.21s), 且连续 10 格零丢键。"""
-        vk, sc, ext = KEYS[name]
+        vk, sc, ext = key_spec(name)
         lp = 1 | (sc << 16) | ((1 << 24) if ext else 0)
         kup = lp | (1 << 30) | (1 << 31)
         win32api.PostMessage(self.hwnd, WM_KEYUP, vk, kup)
@@ -195,13 +393,126 @@ def frame_diff(a0, a1):
     return float((np.abs(a0 - a1).max(axis=2) > 12).mean())
 
 
-def is_battle(a):
+def _bmask_green(R, G, B):
+    """MP 数字绿 (2026-09-30 真机标定: 主体 (80,184,148), 抗锯齿暗边 (21,126,82))。
+    旧版 teal 掩码要求 B∈[100,190] 太窄, 这里放宽 B 下限但收紧要求数字必须成块。"""
+    return (G >= 130) & (G > R + 40) & (G > B + 15) & (B >= 50) & (B <= 210)
+
+
+def _bmask_white(R, G, B):
+    """HP 数字暖白 (真机标定 (212,200,168), mn=168 —— 阈值 170 会刚好漏掉!)。"""
+    mn = np.minimum(np.minimum(R, G), B)
+    mx = np.maximum(np.maximum(R, G), B)
+    return (mn >= 158) & (mx - mn <= 60)
+
+
+def _bmask_brown(R, G, B):
+    """状态栏面板底色 (bfrac 只在数字锚定的矩形内统计, 不看全图):
+    深棕 (62,28,13, 7月标定) / 砖红 (148,32,24, 场景185 实测) 两族都要认。"""
+    brown = (R >= 38) & (R <= 95) & (G >= 8) & (G <= 60) & (B >= 0) & (B <= 40) \
+        & (R > G + 15) & (G >= B)
+    brick = (R >= 110) & (R <= 200) & (G <= 75) & (B <= 75) & (R > G + 55)
+    return brown | brick
+
+
+def battle_ui_feat(a, band0=None):
+    """战斗底部 UI 精确特征 (v2, 2026-09-30): 绿色 MP 数字锚定法。
+
+    旧 is_battle = 底部 30% 波段里数"棕框像素"和"青字像素":
+      * 棕框掩码被场景污染 —— 熔岩地图 19% 的地面像素命中"棕框"色;
+      * 波段顶 int(h*0.70) 在竖长窗口会落到面板之下。
+    v2 改为**以 MP 数字为锚**反查整个状态栏 (数字是战斗 UI 独有、任何场景都一样):
+      1. 底部波段内找绿色数字块 (按列聚类, 每块 = 一名队员的 MP 数字);
+      2. 同列上方 0.2~2.6 个数字高处必须有白色 HP 数字 (≥0.35×绿像素数);
+      3. 数字周围 2.8dh 高的矩形内棕框占比 ≥0.18 (状态栏底板)。
+    所有尺寸以数字高度 dh 自标定 -> 天然抗窗口缩放; 场景再红也造不出
+    "绿数字+上方白数字+周围棕框"三件套。
+    返回 dict(band_top, green, spans=[...], ok)。
+    """
     h, w = a.shape[:2]
-    band = a[int(h * 0.70):, :, :]
+    # 波段顶: 默认 45% (覆盖竖长窗口); 调用方给 band0 时只放宽不收紧 (≥底部 40%)
+    top = int(h * 0.45) if band0 is None else min(int(band0), int(h * 0.60))
+    top = max(0, min(top, h - 8))
+    feat = {"band_top": top, "green": 0, "spans": [], "ok": False}
+    band = a[top:, :, :]
     R, G, B = band[..., 0], band[..., 1], band[..., 2]
-    box = (R >= 38) & (R <= 95) & (G >= 8) & (G <= 60) & (B >= 0) & (B <= 40) & (R > G + 15) & (G >= B)
-    teal = (G >= 130) & (G > R + 55) & (B >= 100) & (B <= 190) & (G > B + 15)
-    return float(box.mean()) > 0.05 and float(teal.mean()) > 0.0015
+    gm = _bmask_green(R, G, B)
+    n_green = int(gm.sum())
+    feat["green"] = n_green
+    if n_green < 30:                      # 1 名队员的 MP 数字 ≳500 像素 (最小窗口)
+        return feat
+    bh = band.shape[0]
+    # ---- 按列聚类出数字块 ----
+    colcnt = gm.sum(axis=0)
+    colthr = max(2, int(0.0008 * bh))
+    xs = np.nonzero(colcnt >= colthr)[0]
+    if xs.size == 0:
+        return feat
+    gap = max(4, int(w * 0.03))           # 两名队员面板间距 >> 数字列间距
+    groups = []
+    s = p = int(xs[0])
+    for x in xs[1:]:
+        x = int(x)
+        if x - p > gap:
+            groups.append((s, p))
+            s = x
+        p = x
+    groups.append((s, p))
+    wm_all = _bmask_white(R, G, B)
+    bm_all = _bmask_brown(R, G, B)
+    for (x0, x1) in groups:
+        sw = x1 - x0 + 1
+        if sw < max(8, int(w * 0.02)):    # 数字块宽度 (1634 宽实测 ~150px)
+            continue
+        sub = gm[:, x0:x1 + 1]
+        rowhit = sub.sum(axis=1) > 0
+        # ---- 按行分段: 背景绿植可能与 MP 数字连成一列块, 按空隙拆开逐段验证 ----
+        runs = []
+        y = 0
+        while y < bh:
+            if rowhit[y]:
+                y2 = y
+                while y2 + 1 < bh and rowhit[y2 + 1]:
+                    y2 += 1
+                runs.append((y, y2))
+                y = y2 + 1
+            else:
+                y += 1
+        merged = []
+        for r in runs:                     # 间隔 <16px 的段合并 (数字行内部的小空隙)
+            if merged and r[0] - merged[-1][1] < 16:
+                merged[-1] = (merged[-1][0], r[1])
+            else:
+                merged.append((r[0], r[1]))
+        for (y0, y1) in merged:
+            dh = max(3, y1 - y0 + 1)      # 数字高度 (自标定基准)
+            if dh > 0.08 * h:             # 一段数字不该占 8% 窗口高 (那是背景物)
+                continue
+            gcnt = int(gm[y0:y1 + 1, x0:x1 + 1].sum())
+            if gcnt < 30:
+                continue
+            wy0, wy1 = max(0, y0 - int(2.6 * dh)), max(0, y0 - int(0.2 * dh))
+            wcnt = int(wm_all[wy0:wy1, x0:x1 + 1].sum()) if wy1 > wy0 else 0
+            by0, by1 = max(0, y0 - int(2.8 * dh)), min(bh, y1 + int(0.8 * dh))
+            barea = max(1, (by1 - by0) * sw)
+            bfrac = float(bm_all[by0:by1, x0:x1 + 1].sum()) / barea
+            ok = (wcnt >= 0.35 * gcnt) and (bfrac >= 0.18)
+            feat["spans"].append({"x": (x0 + x1) // 2, "y": top + (y0 + y1) // 2,
+                                  "dh": dh, "green": gcnt, "white": wcnt,
+                                  "brown": round(bfrac, 3), "ok": ok})
+            if ok:
+                feat["ok"] = True
+    return feat
+
+
+def is_battle(a, band0=None):
+    """战斗画面判定 v2 (2026-09-30): MP 数字锚定 + HP 数字/棕框复核。
+
+    band0: 波段顶像素行 (兼容旧调用); None = int(h*0.45)。
+    旧版两掩码在熔岩等红色场景失效 (棕框掩码被地面污染 19%),
+    v2 锚定战斗 UI 独有的绿色 MP 数字, 场景无关、缩放无关。
+    """
+    return battle_ui_feat(a, band0)["ok"]
 
 
 def menu_warm(a):
@@ -1948,8 +2259,8 @@ class PalBot:
 
     def _fight_battle(self, g, tag=""):
         """战斗处理: 一旦进入就驻守此循环, 持续盯画面直到连续确认脱战。
-        期间只按 F(攻击)/空格(结算推进), 绝不按方向键 (用户要求)。"""
-        self.log("[战斗] 交战, 按 F 最强法术%s" % tag)
+        期间只按攻击键(重复出手)/空格(结算推进), 绝不按方向键 (用户要求)。"""
+        self.log("[战斗] 交战, 按 %s 最强法术%s" % (attack_key(), tag))
         t0 = time.time()
         won = 0
         while time.time() - t0 < 180.0:
@@ -2188,11 +2499,11 @@ class PalBot:
     MONSTER_PROBE_TILES = 16
 
     def _fight_until_done(self, g, max_rounds=90):
-        """战斗中连按 F 直到脱战。返回 True = 本次确实打了一场"""
+        """战斗中连按攻击键直到脱战。返回 True = 本次确实打了一场"""
         if not is_battle(g.shot()):
             return False
         for _ in range(max_rounds):
-            g.key("f")
+            g.attack()
             time.sleep(1.1)
             if is_battle(g.shot()):
                 continue
@@ -2374,14 +2685,14 @@ class PalBot:
         a = g.shot()
         st = self.state_name(a)
 
-        # ---- 战斗中: 一路按 F（没蓝游戏自动普攻）----
+        # ---- 战斗中: 一路按攻击键（没蓝游戏自动普攻）----
         if st == "battle":
             if self.not_battle_count != 0:
-                self.log("[战斗] 交战, 按 F 最强法术")
+                self.log("[战斗] 交战, 按 %s 最强法术" % attack_key())
             self.not_battle_count = 0
             self.was_battle = True
             self.map_stable_since = time.time()
-            g.key("f")
+            g.attack()
             time.sleep(1.1)
             return
 

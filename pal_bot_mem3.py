@@ -29,6 +29,7 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE)
 
 import pal_bot as PB                                   # noqa: E402
+import pal_bot_mem as PM                               # noqa: E402
 import pal_bot_mem2 as V13                             # noqa: E402
 from pal_bot_mem2 import MemBot2                       # noqa: E402
 
@@ -44,6 +45,9 @@ class MemBot3(MemBot2):
     LOCK_F = 0.200        # 两次按下之间的最小间隔
     BUDGET_F = 0.460      # 基础单格预算 (两次按键机会)
     TURN_EXT = 0.230      # 检测到"引擎接受了转身"后追加的预算
+    # ★ 2026-09-30: 单步内最多追加几次。朝向抖动/反复被吃时不至于把 t_end
+    #   无限推后 (最坏 = 0.46 + 2×0.43 ≈ 1.32s, 仍然是有限值)。
+    TURN_EXT_MAX = 2
 
     def __init__(self, *a, **kw):
         super().__init__(*a, **kw)
@@ -79,6 +83,7 @@ class MemBot3(MemBot2):
         self.g.key(key)                       # ★ key 风格, 不是 tap!
         self._last_press = t0
         n_retry = 0
+        n_ext = 0
         nxt = t0 + self.LOCK_F
         while True:
             s1 = self.mem.state()
@@ -91,13 +96,17 @@ class MemBot3(MemBot2):
                     return ("moved", K0, s1["K"], s1["scene"])
             now = time.perf_counter()
             # 引擎接受了"转身"(朝向变了但没走): 多给一个完整动画周期
+            # ★ 修好朝向索引 (W[52]) 后这一段才第一次真正生效 —— 换方向时
+            #   第一次按键只被吃成转身, 不追加预算就会在 0.46s 处误判成"真墙"。
             d1 = self._party_dir()
-            if d1 != dir_seen:
+            if d1 is not None and d1 != dir_seen:
                 dir_seen = d1
-                self._n_turn += 1
-                ext = now + self.LOCK_F + self.TURN_EXT
-                if ext > t_end:
-                    t_end = ext
+                if n_ext < self.TURN_EXT_MAX:
+                    n_ext += 1
+                    self._n_turn += 1
+                    ext = now + self.LOCK_F + self.TURN_EXT
+                    if ext > t_end:
+                        t_end = ext
             if now >= nxt:
                 self.g.key(key)
                 self._last_press = time.perf_counter()
@@ -109,9 +118,14 @@ class MemBot3(MemBot2):
             time.sleep(0.003)
 
     def _party_dir(self):
-        """wPartyDirection @0x00C3C958 (v12 标定), 与坐标同窗口免费读取。"""
+        """wPartyDirection @0x00C3C958 = W[52] (v12 标定 "51" 是错的, 见 IPD 注释)。
+
+        取值 0=下 1=左 2=上 3=右 (SDLPAL 约定)。
+        2026-09-30 用真实移动方向 24 样本校验: down->0 up->2 left->1 right->3 全中;
+        旧索引 51 的值与朝向无相关性 (随机), 所以 "转身" 计数一直是 0。
+        """
         W = self.mem.raw()
-        return None if W is None else W[51]   # (0x00C3C958-0x00C3C8F0)//2 = 51
+        return None if W is None else W[PM.IPD]
 
     def _rate(self, dt, n_retry, stalled):
         self._n_retry += n_retry
@@ -137,35 +151,62 @@ class MemBot3(MemBot2):
     # ------------------------------------------------------------------
     #  唯一允许截图的地方: 该动却没动
     # ------------------------------------------------------------------
+    MENU_MIS_CD = 120.0          # 菜单误报后跳过菜单判定的冷却 (秒)
+
     def _esc_if_menu(self, a):
+        """停机画面像菜单 -> esc 关掉并验证。返回 True = 确实处理了菜单。
+
+        ★ v2 (2026-09-30 场景185 熔岩图事故) 三处加固:
+          1. red 判据带上限 CAP (mem2._menu_like): 熔岩地面 red=0.45 远超真子页面
+             0.08~0.10, 旧版把红色场景全判成菜单, esc 每 1s 开合一次死循环;
+          2. "已关闭"的判据从"画面变了"改成"菜单特征消失" —— 旧判据在地图上按
+             esc 会把"系统菜单被打开"当成"菜单已关闭" (画面确实变了!),
+             这正是 开菜单->关菜单 死循环的燃料;
+          3. 检测到"esc 反而打开了系统菜单" -> 关回去 + 冷却 120s 跳过菜单判定,
+             让 _stall 继续走战斗/被挡分类, 不再空转。
+        """
+        if time.time() < getattr(self, "_menu_mis_t", 0.0):
+            return False
         red, tan = self._menu_feat(a)
-        if tan > self.MENU_TAN_TH or red > self.MENU_RED_TH:
-            # ★ 2026-09-28 复核修复 (9/27 锁妖塔事故):
-            #   场景暖色墙面让 red 擦线误报 (0.043 > 0.04), 旧版直接按 esc
-            #   并返回"已处理", 结果 esc 按了上千次画面纹丝不动,
-            #   把"实测被挡绕行"逻辑饿死, 空转 20 分钟到保险停机。
-            #   现在按 esc 后验证画面: 连续两次不变 -> 根本不是菜单(误报),
-            #   放弃菜单分支, 让 _stall 继续走战斗判定/被挡绕行。
-            for _i in range(2):
-                self.press_esc()
-                a2 = self.g.shot()
-                self._n_shot += 1
-                if self._diffpix(a, a2) > 1500:   # 画面变了 -> 真菜单已关掉
-                    self.log("[快] 停机画面=菜单 (red=%.3f tan=%.3f) -> esc 已关闭"
-                             % (red, tan))
-                    return True
-            self.log("[快] 菜单复核: esc x2 画面不变 (red=%.3f tan=%.3f) -> 误报,"
-                     " 转入战斗/被挡分类" % (red, tan))
-            # 战斗刚触发时命令菜单可能还没画出来 (9/27 实测的正是这种状态):
-            # 给它 1 秒出现的机会, 出现了就直接进战斗循环
-            time.sleep(1.0)
-            a3 = self.g.shot()
-            self._n_shot += 1
-            if PB.is_battle(a3):
-                self.log("[快] 菜单误报复核: 1 秒后战斗菜单出现 -> 进战斗循环")
-                self.fight(why="菜单误报后战斗复核")
-                return True
-            self.log("[快] 复核结束: 既非菜单也非战斗 -> 当墙/被挡处理")
+        if not self._menu_like(red, tan):
+            return False
+        self.press_esc()
+        a2 = self.g.shot()
+        self._n_shot += 1
+        red2, tan2 = self._menu_feat(a2)
+        # ★ 先判"esc 反而开出了菜单"再判"已关闭": 红场景里 red 超 CAP 时
+        #   menu_like 本来就为假, 直接判"已关闭"会把误开的菜单留在屏幕上。
+        opened = ((tan2 > self.MENU_TAN_TH and tan <= self.MENU_TAN_TH)
+                  or (red2 >= self.MENU_RED_CAP and red < self.MENU_RED_CAP))
+        if opened:
+            self.press_esc()                       # 把误开的系统菜单关回去
+            self._menu_mis_t = time.time() + self.MENU_MIS_CD
+            self.log("[快] 菜单误报 (red=%.3f tan=%.3f): esc 反而开了系统菜单 -> "
+                     "已关回, %.0fs 内跳过菜单判定" % (red, tan, self.MENU_MIS_CD))
+            return False
+        if not self._menu_like(red2, tan2):
+            self.log("[快] 停机画面=菜单 (red=%.3f tan=%.3f) -> esc 已关闭" % (red, tan))
+            return True
+        self.press_esc()
+        a3 = self.g.shot()
+        self._n_shot += 1
+        red3, tan3 = self._menu_feat(a3)
+        if not self._menu_like(red3, tan3):
+            self.log("[快] 停机画面=菜单 (red=%.3f tan=%.3f) -> esc x2 已关闭" % (red, tan))
+            return True
+        self._menu_mis_t = time.time() + self.MENU_MIS_CD
+        self.log("[快] 菜单复核: esc x2 特征未消失 (red=%.3f tan=%.3f) -> 误报, 冷却 %.0fs"
+                 % (red, tan, self.MENU_MIS_CD))
+        # 战斗刚触发时命令菜单可能还没画出来 (9/27 实测的正是这种状态):
+        # 给它 1 秒出现的机会, 出现了就直接进战斗循环
+        time.sleep(1.0)
+        a4 = self.g.shot()
+        self._n_shot += 1
+        if PB.is_battle(a4, self.band0()):
+            self.log("[快] 菜单误报复核: 1 秒后战斗菜单出现 -> 进战斗循环")
+            self.fight(why="菜单误报后战斗复核")
+            return True
+        self.log("[快] 复核结束: 既非菜单也非战斗 -> 当墙/被挡处理")
         return False
 
     def _stall(self, key, K0, sc0, n_retry):
@@ -177,7 +218,7 @@ class MemBot3(MemBot2):
         self._n_shot += 1
         if self._esc_if_menu(a):
             return ("menu", K0, K0, sc0)
-        if PB.is_battle(a):
+        if PB.is_battle(a, self.band0()):
             self.log("[快] 停机=战斗 -> 进战斗循环")
             self.fight(why="快路径停机判定")
             return ("battle", K0, K0, sc0)
@@ -193,7 +234,7 @@ class MemBot3(MemBot2):
             self._n_shot += 1
             if self._esc_if_menu(a2):
                 return ("menu", K0, K0, sc0)
-            if PB.is_battle(a2):
+            if PB.is_battle(a2, self.band0()):
                 self.log("[快] 停机=战斗(二次判定第%d轮) -> 进战斗循环" % (i + 1))
                 self.fight(why="快路径停机二次判定")
                 return ("battle", K0, K0, sc0)
@@ -201,7 +242,7 @@ class MemBot3(MemBot2):
                 self.log("[快] 停机=黑屏(二次) -> 等恢复")
                 time.sleep(0.8)
                 continue
-            if self._diffpix(a, a2) < 2500:      # 画面完全静止 -> 真墙
+            if self._diffpix(a, a2) < self.px_thr(self.F_WALL):      # 画面完全静止 -> 真墙
                 if self._dump_n < 8:
                     self._dump_n += 1
                     try:

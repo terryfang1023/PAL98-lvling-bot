@@ -12,6 +12,10 @@ sys.path.insert(0, BASE)
 
 from pal_bot_mem5 import MemBot5, cheb            # noqa: E402
 
+# ★ 2026-09-30: 干跑也算"只读", 同样不能往 bot_log_mem.txt 追加 (那会污染
+#   正在跑的机器人的日志, 并让 run_report.py 多认出一条假运行段)。
+MemBot5.NO_LOGFILE = True
+
 
 def main():
     bot = MemBot5(max_battles=None, max_seconds=None, stall_limit=10 ** 9)

@@ -21,14 +21,15 @@
       整段日志几乎每场都是这个指纹 => 机器人长期卡在
       「走一步被吞 -> 判战斗 -> 白烧 6 秒 -> 回来再走一步」的循环里。
     真战斗也被同一段代码拖累: 结束时 8 次确认 x 0.6s = 4.8 秒, 而战斗本身
-    按 F 两下就结束了 (约 1.5 秒) => 有效时间只占 20%。
+    按两下攻击键就结束了 (约 1.5 秒) => 有效时间只占 20%。
 
     v15 的 fight():
       ① 进场先花 <=1.2 秒确认 (4 x 0.3s): 一次都没看到战斗画面就立刻退出,
          **一个键都不按** (旧版要按 7 次 space 等 4.8 秒)
-      ② 真战斗: 按 F (用户铁律: 只用 F) -> 结束判定 = "is_battle 假 且 画面静止"
+      ② 真战斗: 按「战斗攻击键」(默认 R, 可在 GUI 调; SDLPAL 官方键表里
+         R=kKeyRepeat 重复上次行动) -> 结束判定 = "is_battle 假 且 画面静止"
          连续 2 次 (约 0.5 秒), 而"攻击/施法动画"期间画面剧烈变化 -> 不算结束
-      ③ 胜场只在真的发出过 F 时才计
+      ③ 胜场只在真的发出过攻击键时才计
       ④ 误抓时把当前格记入绕行 (AgedSet 会自愈), 并限流自救 (连续 3 次 -> space)
 """
 import os
@@ -43,9 +44,13 @@ import pal_bot as PB                                       # noqa: E402
 import pal_bot_mem2 as V13                                 # noqa: E402
 from pal_bot_mem2 import MemBot2, BAR, BATTLE_MAX           # noqa: E402
 from pal_bot_mem3 import MemBot3                            # noqa: E402
+from pal_bot_heal import HealMixin, diff_frac                # noqa: E402
+import wingeom                                              # noqa: E402
 
 
-class MemBot4(MemBot3):
+class MemBot4(HealMixin, MemBot3):
+    # ★ HealMixin = 战后自动补血宏 (pal_bot_heal.py)。放在 MemBot3 前面只是
+    #   为了让 heal_* 方法在 MRO 里先被找到; 它不覆写任何 v13/v15 的方法。
     # ---- 渐进巡逻参数 (v15b) ----
     # 实测教训 (v15 首版): 纯"全图均匀巡逻"会把大量步数花在无怪区,
     # 刷怪效率反而与 v14 持平 (0.8 场/分)。改为: 锚点(怪窝)周围从 28 格起,
@@ -66,16 +71,24 @@ class MemBot4(MemBot3):
     SCAN_MIN_CELLS = 5        # 动屑块最小尺寸 (8x8 像素块数)
     CHASE_MAX_TRIES = 3       # 同一格追 3 次没开打 -> 判定是静态动画, 学习拉黑
     CHASE_MAX_DIST = 25       # 动屑换算的 K 离队伍超过此格数 -> 视为换算误差, 忽略
-    GAME_Y0, GAME_Y1 = 139, 1189     # 游戏视口在 1687x1294 窗口截屏中的 y 范围
-    SCALE_X = 1687 / 320.0           # 窗口截屏 -> 游戏 320x200 原生坐标
+    # ★ v17.2: 下面这几个像素常量只作为"标定值备查", 运行时一律走
+    #   self.geo() / wingeom.* 换算 (窗口被手动缩放后它们就不再成立)。
+    GAME_Y0, GAME_Y1 = 139, 1189     # 标定窗口 1687x1294 下视口的 y 范围
+    SCALE_X = 1687 / 320.0           # 标定窗口 -> 游戏 320x200 原生坐标
     SCALE_Y = (GAME_Y1 - GAME_Y0) / 200.0
 
     # ---- 战斗判定参数 (v15 提速核心) ----
     PROBE_N = 4               # 进场确认次数
     PROBE_DT = 0.30           # 每次间隔 => 最多 1.2 秒判定"是不是真战斗"
-    ANIM_BIG = 8000           # 画面剧烈变化的像素阈值 (攻击/施法动画)
+    # ★ v18.4 (2026-10-04 场景221 事故): 连续 N 次"进场即菜单"但停机判定
+    #   坚持是战斗 -> 强制进战斗循环。战斗中的指令菜单会骗过 ui_menu
+    #   (red≈0.063 落在 0.04~0.30 区间), 但极少骗过 is_battle v2 ——
+    #   两个判定矛盾时信 is_battle; 就算真误判, 主循环 ui_menu 也会先
+    #   esc 关菜单, 再走正常的结束确认, 无害。
+    MENUENTER_FORCE = 3
+    ANIM_BIG = 8000           # (旧)画面剧烈变化的像素阈值; 现用 MemBot.F_ANIM_BIG
     END_CONFIRM = 2           # 连续 N 次「非战斗 + 画面静止」= 真结束
-    KEY_F_GAP = 0.60          # 按 F 的间隔 (等一击动画走完)
+    KEY_F_GAP = 0.60          # 两次攻击键之间的间隔 (等一击动画走完)
 
     def __init__(self, *a, **kw):
         super().__init__(*a, **kw)
@@ -84,6 +97,10 @@ class MemBot4(MemBot3):
         self._pick_n = 0
         self._false_battle = 0    # 累计误抓次数
         self._false_streak = 0    # 连续误抓
+        self._menuenter_n = 0     # ★ v18.4 "进场即菜单"累计 (诊断存图用)
+        self._menuenter_streak = 0  # ★ v18.4 连续"进场即菜单" (死循环兜底)
+        # 补血失败留证目录 (pal_bot_heal._heal_fail_shot; 测试宿主不设=不存图)
+        self.heal_shot_dir = BASE
         self._t_walk = 0.0        # 累计走路耗时
         self._t_fight = 0.0       # 累计战斗耗时
         self._t_false = 0.0       # 累计误抓耗时
@@ -248,11 +265,16 @@ class MemBot4(MemBot3):
     def _screen_to_K(self, sx, sy, st):
         """截屏像素 -> 地图 K 坐标。
         队伍恒在视口中心 (partyoffset 160,112 恒定), 其世界像素 = st[px,py];
-        动屑相对队伍的屏幕偏移除以缩放 = 原生像素偏移, 加到队伍世界像素上。"""
-        pcx = 1687 / 2.0
-        pcy = (self.GAME_Y0 + self.GAME_Y1) / 2.0
-        wx = st["px"] + (sx - pcx) / self.SCALE_X
-        wy = st["py"] + (sy - pcy) / self.SCALE_Y
+        动屑相对队伍的屏幕偏移除以缩放 = 原生像素偏移, 加到队伍世界像素上。
+
+        ★ v17.2: 视口中心与缩放不再硬编码 —— 窗口被手动缩放后它们会变,
+          换个尺寸就会把动屑换算到错误的格子上 (追怪乱跑)。"""
+        geo = self.geo()
+        pcx = wingeom.content_cx(geo)
+        pcy = wingeom.content_cy(geo)
+        scx, scy = geo["scale"]
+        wx = st["px"] + (sx - pcx) / scx
+        wy = st["py"] + (sy - pcy) / scy
         return (int(np.floor((wx - 2 * wy) / 32.0)),
                 int(np.floor((wx + 2 * wy - 32) / 32.0)))
 
@@ -276,10 +298,14 @@ class MemBot4(MemBot3):
         d = np.abs(a1.astype(np.int16) - a2.astype(np.int16)).sum(axis=2)
         mask = d > self.SCAN_DIFF_TH
         h, w = mask.shape
-        pcy = (self.GAME_Y0 + self.GAME_Y1) // 2
-        mask[:self.GAME_Y0 - 4, :] = False             # 排除黑边
-        mask[self.GAME_Y1 + 4:, :] = False
-        mask[pcy - 110:pcy + 110, w // 2 - 100:w // 2 + 100] = False  # 队伍
+        geo = self.geo()
+        pcy = wingeom.content_cy(geo)
+        top, bot = wingeom.content_band(geo)           # 挖掉视口上下的黑边
+        mask[:top, :] = False
+        mask[bot:, :] = False
+        pdx, pdy = wingeom.party_box(geo)              # 队伍自身动画 (按缩放换算)
+        ccx = wingeom.content_cx(geo)
+        mask[pcy - pdy:pcy + pdy, ccx - pdx:ccx + pdx] = False
         anim = self._animK.setdefault(self.scene, {})
         tries = self._chase_tries
         ban, reach = self.plan_ctx(cur)
@@ -332,7 +358,11 @@ class MemBot4(MemBot3):
             if mk is not None:
                 return mk
 
-        self.visit_cnt[cur] = self.visit_cnt.get(cur, 0) + 1
+        # ★ 2026-10-04: 「访问次数」的记账搬到了 MemBot.step() (真实踏上才 +1)。
+        #   这里以前也 +1 -> 只有巡逻层选点时才计数, 主模式(要素巡回)压根不走
+        #   这个分支, 于是 visit_cnt 在主模式下永远是空的, 下面 vc 那套"访问
+        #   次数最少的一档"等于没生效。留在 step() 一处, 语义是"踏上的次数",
+        #   巡逻/怪点/寻路三个消费方共用同一份真值。
         ban, reach = self.plan_ctx(cur)                   # ★ 门禁分级 = 防出门
         cands = [c for c in reach if c not in ban and c != cur and c != exclude]
         if not cands:
@@ -378,7 +408,7 @@ class MemBot4(MemBot3):
         def dist_a(c):
             return max(abs(c[0] - anchor[0]), abs(c[1] - anchor[1]))
 
-        vc = self.visit_cnt
+        vc = getattr(self, "visit_cnt", None) or {}       # 裸影子对象要兜底
         # ★ 渐进半径: 锚点周围从 PATROL_R0 起, 该圈内全访问过就扩一圈
         ring = unvis = None
         R = self._patrol_r
@@ -435,8 +465,9 @@ class MemBot4(MemBot3):
     #    ① 场景动态图块 (火把火焰闪烁): 画面小幅持续变化, 不是战斗
     #    ② 穿门换图的淡入: 画面整体压暗渐亮, 也不是战斗
     #    两者都曾被送进 fight() 白烧 1.7s。现在:
-    #    - 平均亮度 <95 -> 淡入/黑屏, 等待 (0.6s)
-    #    - diff>150000 (约7%像素) 才算战斗转场; 鬼阴坛火把/水波动画实测 diff~13000
+    #    - 平均亮度 <25 -> 真黑, 才可能是淡入 (鬼阴坛洞穴正常画面均值~44)
+    #    - diff 超过"全屏 6.9% 像素" (标定窗口下 = 150000) 才算战斗转场;
+    #      鬼阴坛火把/水波动画实测 ~13000 -> 用比例阈值, 窗口缩放后依然成立
     #    - 其余一律当墙处理 (省 0.8s); 旧阈值 15000 与环境动画同量级 -> 误抓泛滥
     # ------------------------------------------------------------------
     def _stall(self, key, K0, sc0, n_retry):
@@ -445,7 +476,7 @@ class MemBot4(MemBot3):
         self._n_shot += 1
         if self._esc_if_menu(a):
             return ("menu", K0, K0, sc0)
-        if PB.is_battle(a):
+        if PB.is_battle(a, self.band0()):
             self.log("[快] 停机=战斗 -> 进战斗循环")
             self.fight(why="快路径停机判定")
             return ("battle", K0, K0, sc0)
@@ -464,7 +495,7 @@ class MemBot4(MemBot3):
             self._n_shot += 1
             if self._esc_if_menu(a2):
                 return ("menu", K0, K0, sc0)
-            if PB.is_battle(a2):
+            if PB.is_battle(a2, self.band0()):
                 self.log("[快] 停机=战斗(二次判定第%d轮) -> 进战斗循环" % (i + 1))
                 self.fight(why="快路径停机二次判定")
                 return ("battle", K0, K0, sc0)
@@ -472,7 +503,7 @@ class MemBot4(MemBot3):
                 time.sleep(0.8)
                 continue
             d = self._diffpix(a, a2)
-            if d < 2500:                       # 完全静止 -> 真墙
+            if d < self.px_thr(self.F_WALL):   # 完全静止 -> 真墙
                 if self._dump_n < 8:
                     self._dump_n += 1
                     try:
@@ -488,7 +519,7 @@ class MemBot4(MemBot3):
             if float(a2.mean()) < 25:          # ★ 真黑 = 淡入中 (洞穴正常画面~44)
                 time.sleep(0.6)
                 return ("black", K0, K0, sc0)
-            if d > 150000:                     # 全屏级变化 -> 疑似战斗转场
+            if d > self.px_thr(self.F_BATTLE_TRANS):   # 全屏级变化 -> 疑似战斗转场
                 a = a2
                 continue
             # ★ 小幅持续变化 = 火把/水波等动态图块, 不是战斗 -> 当墙处理
@@ -502,26 +533,71 @@ class MemBot4(MemBot3):
     # ------------------------------------------------------------------
     #  快速战斗判定: 覆写 fight
     # ------------------------------------------------------------------
+    def _battle_confirm(self):
+        """进场确认 (v18.4 抽出, 可独立测试)。
+
+        返回 ("conf", dt) / ("menu", dt) / ("none", dt)。
+
+        ★ v18.4 语义 (2026-10-04 场景221 事故): 整个 PROBE 窗口
+          (PROBE_N x PROBE_DT) 逐帧判定, 谁先出现谁赢:
+            - 任一帧 is_battle 真 -> conf。战斗中的指令菜单 (攻击/法术/
+              物品) 同时满足 ui_menu (red≈0.063 落在 0.04~0.30) —— 旧版
+              每帧**先查 ui_menu**, 真战斗第一帧撞上指令菜单就按 esc 退出;
+              下一轮 _stall 又判战斗再进 fight, 此时指令菜单常开 -> 永远
+              撞上 -> 死循环 (221 卡死近 3 小时, "进场即菜单" 9359 次)。
+            - 全窗口 is_battle 假但见过 ui_menu -> "menu" (地图上开着
+              系统菜单/对话框的真误抓), 由 fight 层 esc 关掉。
+            - 全窗口两者皆无 -> "none" (旧"误抓"分支, 不按键直接退)。
+          连续 MENUENTER_FORCE 个窗口只见菜单、但停机判定坚持是战斗 ->
+          强制 conf (信 is_battle v2; 主循环 ui_menu 仍先 esc, 真是
+          菜单也无害)。
+        """
+        t_probe = time.time()
+        saw_menu = False
+        menu_frame = None
+        for _ in range(self.PROBE_N):
+            a = self.g.shot()
+            if PB.is_battle(a, self.band0()):
+                self._menuenter_streak = 0      # 是真战斗: 菜单连败清零
+                return ("conf", time.time() - t_probe)
+            if not saw_menu and self.ui_menu(a):
+                saw_menu, menu_frame = True, a
+            time.sleep(self.PROBE_DT)
+        dt = time.time() - t_probe
+        if not saw_menu:
+            return ("none", dt)
+        self._menuenter_n += 1
+        n, streak = self._menuenter_n, self._menuenter_streak + 1
+        self._menuenter_streak = streak
+        if n <= 3:                              # 诊断留档 (只留前 3 张)
+            try:
+                from PIL import Image
+                Image.fromarray(menu_frame.astype("uint8")).save(os.path.join(
+                    BASE, "menuenter_%d_K%d_%d.png"
+                    % (n, self.mem.state()["K"][0], self.mem.state()["K"][1])))
+            except Exception:
+                pass
+        if streak >= self.MENUENTER_FORCE:
+            # 兜底: 停机判定坚持是战斗、进场确认却连续只见"菜单"。
+            self._menuenter_streak = 0
+            self.log("[战斗] 连续%d个窗口只见菜单, 但停机判定坚持是战斗 "
+                     "-> 强制进战斗循环 (v18.4 兜底)" % streak)
+            return ("conf", dt)
+        self.log("[战斗] 进场即菜单(%.1fs) -> esc, 判为误抓 (累计%d, 连续%d)"
+                 % (dt, n, streak))
+        return ("menu", dt)
+
     def fight(self, why=""):
         self._chase_tries = {}      # 开打了: 追怪计数清零 (怪是真的)
         self._chase_goal = None     # 目标已达成, 解除"不记绕行"保护
         st = self.mem.state()
         sc, K = st["scene"], st["K"]
         # ① 进场确认: 真战斗不可能一进来就是结束画面
-        conf = False
-        t_probe = time.time()
-        for _ in range(self.PROBE_N):
-            a = self.g.shot()
-            if self.ui_menu(a):
-                self.log("[战斗] 进场即菜单 -> esc, 判为误抓")
-                self.press_esc()
-                return False
-            if PB.is_battle(a):
-                conf = True
-                break
-            time.sleep(self.PROBE_DT)
-        if not conf:
-            dt = time.time() - t_probe
+        kind, dt = self._battle_confirm()
+        if kind == "menu":
+            self.press_esc()
+            return False
+        if kind == "none":
             self._false_battle += 1
             self._false_streak += 1
             self._t_false += dt
@@ -579,27 +655,36 @@ class MemBot4(MemBot3):
                 reason = "停止标志"
                 break
             a = self.g.shot()
+            mb = PB.is_battle(a, self.band0())
+            if mb:
+                # ★ v18.5 战斗特征优先 (与 v18.4 进场确认同一铁律):
+                #   指令菜单开着的战斗画面 red≈0.065 会命中 ui_menu
+                #   (2026-10-04 场景221 实测), 旧顺序 ui_menu 先行 ->
+                #   每帧只按 esc, 攻击键一次发不出, 180s 超时判负,
+                #   快停又见"战斗菜单"再进场 -> 死循环。
+                #   is_battle v2 靠底部 HP/MP 数字, 战斗画面(含指令菜单
+                #   开着)恒真; 法术页无数字仍是 ui_menu+esc, 旧担忧已由
+                #   v2 化解。
+                lost = 0
+                self.g.attack()          # ★ 战斗攻击键 (默认 R=重复上次行动, GUI 可调)
+                n_f += 1
+                time.sleep(self.KEY_F_GAP)
+                continue
             if self.ui_menu(a):
-                # 菜单类画面 (含"法术页", is_battle 会误报 True) -> 只按 esc
+                # 菜单类画面且无战斗特征 (法术页/系统菜单) -> 只按 esc
                 self.press_esc()
                 continue
             if over > self.LONG_BATTLE and over - last_esc > 8.0:
                 last_esc = over
                 self.press_esc()
                 continue
-            if PB.is_battle(a):
-                lost = 0
-                self.g.key("f")          # ★ 用户铁律: 战斗里只用 F
-                n_f += 1
-                time.sleep(self.KEY_F_GAP)
-                continue
             # is_battle 假: 是"攻击/施法动画"还是"真结束"?
             time.sleep(0.18)
             a2 = self.g.shot()
-            if PB.is_battle(a2):
+            if PB.is_battle(a2, self.band0()):
                 lost = 0
                 continue
-            if self._diffpix(a, a2) > self.ANIM_BIG:
+            if self._diffpix(a, a2) > self.px_thr(self.F_ANIM_BIG):
                 continue                  # 画面剧烈变化 -> 动画中, 继续打
             lost += 1
             if lost >= self.END_CONFIRM:
@@ -617,6 +702,11 @@ class MemBot4(MemBot3):
             time.sleep(0.35)
             self.g.key("space")
         self.g.flush_keys()
+        # ③.5 等结算画面/淡入散场 (v18.7): 补血宏的基准帧 a0 必须是
+        #   "稳定的地图"。否则 a0 拍到淡入中的半暗画面, 宏按完后画面回到
+        #   正常亮度的地图, diff(a0,末帧) 恒 > SETTLE_FRAC -> 永远判
+        #   "没回到地图" (真机 heal_fail_101323: 明明是干净地图却判失败)。
+        self._settle_screen()
         if n_f >= 1:
             self.battles_won += 1
             self.last_win = time.time()
@@ -630,7 +720,33 @@ class MemBot4(MemBot3):
                  % (n, reason, dur, n_f, self.battles_won,
                     time.strftime("%H:%M:%S")))
         self.log(BAR)
+        # ★ 战后自动补血 (2026-10-01 用户诉求: 战斗太吃力, 想每场打完自动加满血)
+        #   只在这一场"真的出手过"(n_f>=1) 之后跑; 误抓不补。开关/场次/冷却
+        #   都在 after_battle_heal 里判断, 关掉时一个键都不发。
+        if n_f >= 1:
+            try:
+                self.after_battle_heal(why="战后补血 #%d" % self.battles_won)
+            except Exception as e:                 # 补血绝不能把主循环带崩
+                self.log("[补血] 异常, 已忽略: %s" % e)
         return True
+
+    def _settle_screen(self, timeout=3.0):
+        """等画面连续两帧稳定 (战斗结算淡入/对话翻页放完)。最多 timeout 秒。
+
+        diff 计算异常 (测试假帧等) 直接返回, 不挡主流程。
+        """
+        try:
+            prev = self.g.shot()
+            t_s = time.time()
+            while time.time() - t_s < timeout:
+                time.sleep(0.3)
+                cur = self.g.shot()
+                if diff_frac(prev, cur) <= 0.015:
+                    return True
+                prev = cur
+        except Exception:
+            pass
+        return False
 
     # ------------------------------------------------------------------
     #  覆写: 统计走路/战斗时间占比 (诊断效率用)

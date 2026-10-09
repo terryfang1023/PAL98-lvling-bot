@@ -36,7 +36,7 @@ import pal_bot_mem as V12
 BASE = V12.BASE
 BAR = "=" * 62
 BATTLE_MAX = 180.0          # 单场战斗最长等待(秒); 一场坏仗不该吃掉5分钟
-ANIM_MIN_PIX = 300          # 判定"画面在动"的最少变化像素数
+ANIM_MIN_PIX = 300          # (旧)判定"画面在动"的像素数; 现用 MemBot.F_ANIM_MIN 按面积折算
 
 
 class AgedSet(set):
@@ -157,6 +157,79 @@ class MemBot2(V12.MemBot):
             return False
         return True
 
+    # ---------- 困区逃逸 (2026-09-29 熔岩走廊实测) ----------
+    TRAP_WIN = 360.0          # 观察窗口 (秒)
+    TRAP_SPREAD = 9.0         # 窗口内采样点离质心的最大切比雪夫距离 <= 此值 = 被困
+    TRAP_MIN_SAMPLES = 60     # 窗口内最少采样步数 (太少 = 刚进场/大多在战斗)
+    TRAP_BLOCKED = 25         # 窗口内「实测被挡」累计 >= 此值才算受困
+    TRAP_CHECK_EVERY = 30.0   # 检查间隔
+    TRAP_CD = 600.0           # 两次逃逸的最小间隔 (防刷屏)
+    TRAP_ESC_R = 14           # 逃逸时清除绕行/长期禁入/怪拉黑的半径
+    TRAP_MIN_REACH = 60       # 清完后可达域低于此 -> 判真地形困死, 直接换场景
+    TRAP_GOAL_TTL = 240.0     # 突围目标有效期
+
+    def _trap_check(self):
+        """困区判定: 位置长时间困在小圈 + 被挡高频 -> 逃逸。30s 一次。"""
+        now = time.time()
+        if now < self._trap_last + self.TRAP_CHECK_EVERY:
+            return
+        self._trap_last = now
+        if now < self._trap_cd_until or self.migrate or self.home_active():
+            return
+        win = [(t, k) for t, k in self._trace if t >= now - self.TRAP_WIN]
+        if len(win) < self.TRAP_MIN_SAMPLES:
+            return
+        ca = sum(k[0] for _, k in win) / len(win)
+        cb = sum(k[1] for _, k in win) / len(win)
+        spread = max(max(abs(k[0] - ca), abs(k[1] - cb)) for _, k in win)
+        if spread > self.TRAP_SPREAD:
+            return
+        bsum = sum(cnt for cnt, last in self.blocked_hits.values()
+                   if now - last <= self.TRAP_WIN)
+        if bsum < self.TRAP_BLOCKED:
+            return
+        self.log("[困区] %.0f 秒内活动半径仅 %.0f 格、被挡 %d 次 -> 启动逃逸"
+                 % (self.TRAP_WIN, spread, bsum))
+        self._trap_escape(self.mem.state()["K"], now)
+
+    def _trap_escape(self, cur, now):
+        """清空身边全部绕行知识; 有路就突围到最远可达格, 没路就换场景。"""
+        self._trap_cd_until = now + self.TRAP_CD
+        R = self.TRAP_ESC_R
+        cleared = 0
+        for c in list(self.blocked):
+            if max(abs(c[0] - cur[0]), abs(c[1] - cur[1])) <= R:
+                self.blocked.discard(c)
+                cleared += 1
+        hits = getattr(self, "blocked_hits", None)
+        if hits:
+            for c in [c for c in hits
+                      if max(abs(c[0] - cur[0]), abs(c[1] - cur[1])) <= R]:
+                hits.pop(c, None)
+        anim = getattr(self, "_animK", None)
+        if anim:
+            a = anim.get(self.scene)
+            if a:
+                for c in [c for c in a
+                          if max(abs(c[0] - cur[0]), abs(c[1] - cur[1])) <= R]:
+                    a.pop(c, None)
+        self._pc_key = None
+        self._mon_goal = None
+        self._chest_goal = None
+        self._trap_goal = None
+        ban = set(self.blocked) - {cur}
+        r = self.reach(cur, ban)
+        if len(r) >= self.TRAP_MIN_REACH:
+            goal = max(r, key=lambda c: (abs(c[0] - cur[0])
+                                         + abs(c[1] - cur[1])))
+            self._trap_goal = (self.scene, goal, now + self.TRAP_GOAL_TTL)
+            self.log("[困区] 清身边 %d 格内 %d 条绕行记录 -> 突围目标 K%s"
+                     % (R, cleared, goal))
+        else:
+            self.log("[困区] 清完可达域仍只有 %d 格 -> 真地形困死, 启动换场景"
+                     % len(r))
+            self.migrate = True
+
     def handle_door(self, K_door, new_scene, key):
         """覆写: 意外穿门且退不回时, 不立刻接受新场景乱跑, 而是记住入口去穿回来。"""
         was_mig = self.migrate
@@ -192,11 +265,11 @@ class MemBot2(V12.MemBot):
             但长时间完全静止(>25 秒)    -> 更像卡在系统菜单 -> 自救。
         """
         a = frame if frame is not None else self.g.shot()
-        if not PB.is_battle(a):
+        band0 = self.band0()
+        if not PB.is_battle(a, band0):
             # 诊断: 战斗刚转非战斗时, 打出底部特征值, 用于查"3.3 秒假结束"
             if self._bf_last:
-                h, w = a.shape[:2]
-                band = a[int(h * 0.70):, :, :]
+                band = a[band0:, :, :] if band0 else a[int(a.shape[0] * 0.70):]
                 R, G, B = band[..., 0], band[..., 1], band[..., 2]
                 box = float(((R >= 38) & (R <= 95) & (G >= 8) & (G <= 60) &
                              (B >= 0) & (B <= 40) & (R > G + 15) &
@@ -217,7 +290,7 @@ class MemBot2(V12.MemBot):
             self._bf_last = True
             return True
         if t - ref[0] >= self.ANIM_WINDOW:
-            moving = self._diffpix(a, ref[1]) >= ANIM_MIN_PIX
+            moving = self._diffpix(a, ref[1]) >= self.px_thr(self.F_ANIM_MIN)
             self._bf_ref = (t, a)
             self._bf_last = moving
             if moving:
@@ -236,7 +309,9 @@ class MemBot2(V12.MemBot):
             #   **单按 esc 就关掉** (变化 28 万像素, is_battle 立刻转假)。
             #   ⚠️ 绝不能盲按两次 esc: 在地图上第二次 esc 会【打开】系统菜单,
             #      于是 bot 自己造出新的假战斗画面, 死循环 (v13l 就是这么卡的)。
-            #   也绝不按 f: f=重复上次动作, 会把法术页重新打开。
+            #   也绝不按 f: SDLPAL 里 f=kKeyForce(法术), 正是它把法术页打开的。
+            #   (旧注释写 "f=重复上次动作" —— 错的; 重复是 r=kKeyRepeat,
+            #    见 botcfg.ATTACK_KEY_CHOICES 的官方键表。)
             okt = self.close_menu_like()
             self._still_since = None
             self._bf_ref = None
@@ -252,13 +327,18 @@ class MemBot2(V12.MemBot):
     def in_battle(self):
         return self.battle_screen()
 
-    # ---------- 菜单画面检测器 (2026-09-24 实测标定) ----------
+    # ---------- 菜单画面检测器 (2026-09-24 实测标定; 2026-09-30 加红上限) ----------
     # is_battle 在"法术页"上会误报 True, 而菜单根上是 False —— 都拦不住方向键。
     # 这里用两个颜色特征把它们变成可判定信号:
     #   法术/子页: 中央大块"暗红面板"占比 > 0.04 (实测 页面0.08~0.10, 战斗/地图<0.01)
     #   菜单根:   左侧"棕黄卷轴"占比 > 0.15 (实测 根0.25, 其它<=0.07)
+    #   ★ 上限 CAP (2026-09-30 场景185 熔岩图事故): 熔岩地图整屏红地面 red=0.45~0.53,
+    #     比真子页面高 5 倍 —— 红色占比超过 CAP 的是"场景本身红", 不是菜单面板。
+    #     没有 CAP 时 ui_menu 在熔岩图恒真: 每步按 esc (开合死循环),
+    #     真战斗也被"进场即菜单 -> esc 判为误抓", 一场都打不了。
     MENU_RED_TH = 0.04
     MENU_TAN_TH = 0.15
+    MENU_RED_CAP = 0.30
 
     @staticmethod
     def _menu_feat(a):
@@ -273,9 +353,16 @@ class MemBot2(V12.MemBot):
                      (B >= 55) & (B <= 140) & (R > B + 40) & (G > B + 15)).mean())
         return red, tan
 
+    @staticmethod
+    def _menu_like(red, tan):
+        """菜单类画面的判据 (red 带上限, 见 MENU_RED_CAP 注释)。"""
+        return (MemBot2.MENU_RED_TH < red < MemBot2.MENU_RED_CAP) \
+            or tan > MemBot2.MENU_TAN_TH
+
     def spell_page(self, frame=None):
         a = frame if frame is not None else self.g.shot()
-        return self._menu_feat(a)[0] > self.MENU_RED_TH
+        red, tan = self._menu_feat(a)
+        return self.MENU_RED_TH < red < self.MENU_RED_CAP
 
     def menu_root(self, frame=None):
         a = frame if frame is not None else self.g.shot()
@@ -285,7 +372,7 @@ class MemBot2(V12.MemBot):
         """True = 屏幕上有任何菜单类画面 -> 绝对禁止方向键。"""
         a = frame if frame is not None else self.g.shot()
         red, tan = self._menu_feat(a)
-        return red > self.MENU_RED_TH or tan > self.MENU_TAN_TH
+        return self._menu_like(red, tan)
 
     def press_esc(self):
         """关掉当前菜单页 (法术页1次esc直达地图; 菜单根1次esc回地图)。"""
@@ -328,7 +415,7 @@ class MemBot2(V12.MemBot):
         self.log("[战斗开始] #%d  场景%s K%s  判据=%s  t=%s"
                  % (n, st["scene"], st["K"], why, time.strftime("%H:%M:%S")))
         self.log(BAR)
-        seq = ["f"]                   # ★ 用户指示: 战斗里只用 F (重复最强攻击)
+        seq = [PB.attack_key()]       # ★ 战斗里只用这一个键 (默认 R; GUI 可调)
         i = 0
         presses = 0
         lost = 0
@@ -345,11 +432,13 @@ class MemBot2(V12.MemBot):
             inb = self.battle_screen()
             if not inb:
                 # ★★ 关键修复 (2026-09-24 12:40 实测):
-                #   战斗其实已经结束, 但本循环过去仍每 0.8 秒按 F —— 而【在地图上
-                #   按 F 会打开"角色名单"系统菜单】(实测: f 后画面变化 40 万像素、
-                #   is_battle 变 True; esc 才关得掉)。菜单里的角色有待机动画, 画面
-                #   永不"静止", 于是所有静止类自救全失效 -> 一场仗白卡 180 秒。
-                #   所以: 一旦判定非战斗, 绝不再按 F, 只按 space 推进战后结算。
+                #   战斗其实已经结束, 但本循环过去仍每 0.8 秒按攻击键 —— 而【在地图上
+                #   按 F 会打开"角色名单/法术"系统菜单】(实测: f 后画面变化 40 万像素、
+                #   is_battle 变 True; esc 才关得掉。f=kKeyForce 法术, 与现在默认的
+                #   r=kKeyRepeat 不同, 但"地图上乱按会开菜单"这条风险对所有键都成立)。
+                #   菜单里的角色有待机动画, 画面永不"静止", 于是所有静止类自救全失效
+                #   -> 一场仗白卡 180 秒。
+                #   所以: 一旦判定非战斗, 绝不再按攻击键, 只按 space 推进战后结算。
                 lost += 1
                 if lost >= self.BATTLE_END_CONFIRM:
                     reason = "连续 %d 次确认非战斗" % lost
@@ -372,7 +461,7 @@ class MemBot2(V12.MemBot):
                 self.press_esc()
                 presses += 1
                 continue
-            self.g.key("f")
+            self.g.attack()
             i += 1
             presses += 1
             time.sleep(0.8)
@@ -423,14 +512,14 @@ class MemBot2(V12.MemBot):
         ⚠️ 不能盲按 N 次 esc: 在地图上 esc 会【打开】系统菜单, 多按反而自造假战斗。
         """
         for i in range(tries):
-            if not PB.is_battle(self.g.shot()):
+            if not PB.is_battle(self.g.shot(), self.band0()):
                 if i:
                     self.log("[MENU] %d 次 esc 后脱离菜单画面" % i)
                 return True
             self.g.key("esc")
             time.sleep(0.8)
         self.g.flush_keys()
-        return not PB.is_battle(self.g.shot())
+        return not PB.is_battle(self.g.shot(), self.band0())
 
     def escape_menu(self, tries=8):
         """脱困 = 只用 esc/space, 绝不发方向键 (用户指示)。
@@ -651,10 +740,20 @@ class MemBot2(V12.MemBot):
         top.sort(key=lambda c: max(abs(c[0] - cur[0]), abs(c[1] - cur[1])))
         return top[0]
 
-    def bfs_path(self, src, dsts, extra_blocked=frozenset(), allow_doors=False):
+    def bfs_path(self, src, dsts, extra_blocked=frozenset(), allow_doors=False,
+                 relax_blocked=False):
+        """relax_blocked=True 时不信「绕行」标记 (只信真地图+walk_path核实)。
+        2026-10-02: 绳子旁走廊被怪挡几次后绳位全进 blocked, 探测永远
+        走不过去 -> rope_probe 对绳位放宽一次。只影响 allow_doors 分支。
+
+        ★ 2026-10-04 生路偏好: 目标仍按 dsts 顺序 + 可达性挑 (语义不变),
+        但**路径**改由 _weighted_path 算 —— 同长度时优先走 visit_cnt 小的格。
+        REVISIT_LAMBDA=0 或 visit_cnt 全空 -> 与历史版本逐位一致。
+        """
         extra = set(extra_blocked)
+        blk = set() if relax_blocked else self.blocked
         if allow_doors:
-            bad = self.blocked | extra
+            bad = blk | extra
             reach = self.reach(src, bad)
         else:
             ban, reach = self.plan_ctx(src)
@@ -666,6 +765,13 @@ class MemBot2(V12.MemBot):
                 break
         if best is None:
             return None
+        lam = getattr(self, "REVISIT_LAMBDA", 0.0)
+        if lam > 0.0:
+            wp = self._weighted_path(src, best, bad, lam)
+            if wp is not None:
+                return wp
+            # 理论上到不了这儿 (reach 已证明可达): 万一算法有分歧,
+            # 退回老 BFS 的 prev 树, 绝不因为"想走生路"而把路走丢。
         path = []
         p = best
         while p is not None:

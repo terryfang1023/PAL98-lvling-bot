@@ -12,10 +12,11 @@
     !!! 旧视觉bot把 up/down 的K方向弄反了, 这是历次锁错层/坐标漂移的总根源 !!!
   - 换图 = wNumScene 变化 (穿门), 门对象坐标可从 gyt_scene_report.txt 预取
 """
-import ctypes, ctypes.wintypes as wt, struct, os, re, sys, time
+import ctypes, ctypes.wintypes as wt, heapq, struct, os, re, sys, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import numpy as np
 import pal_bot as PB
+import wingeom
 
 k32 = ctypes.windll.kernel32
 OPEN_OK = 0x0010 | 0x0400
@@ -27,9 +28,35 @@ TABLE_REGION = 0x00C30000
 TABLE_SIZE = 0x10000
 IVP = (0x00C3C8FC - READ_AT) // 2
 IPO = (0x00C3C900 - READ_AT) // 2
+# ★ 2026-09-30 修正: 队伍朝向 wPartyDirection @0x00C3C958 -> 索引 52 (不是 51!)
+#   0x00C3C958 - 0x00C3C8F0 = 104 字节 = 52 个 uint16。
+#   佐证: 同窗口 wNumScene @0x00C3C95A -> 索引 53, 实测恒等于当前场景号。
+#   旧值 51 指向 0x00C3C956 (另一个字段), 导致 "转身" 永远检测不到
+#   (历代日志 "转身0" 的根源), step() 的 TURN_EXT 追加预算从未生效 ->
+#   每次改变方向按键被引擎吃成转身时, 0.46s 预算耗尽被误判成 "真墙"。
+IPD = (0x00C3C958 - READ_AT) // 2
 KEYDK = {"up": (1, 0), "down": (-1, 0), "left": (0, -1), "right": (0, 1)}
 DIRKEY = {v: k for k, v in KEYDK.items()}
 BASE = os.path.dirname(os.path.abspath(__file__))
+
+
+def _cfg_float(key, default):
+    """取一个浮点配置: 环境变量 PAL_<KEY> > bot_config.json > default。
+
+    mem.py 是底层模块, 不 import botcfg (那是可选依赖), 所以这里容错到底 ——
+    配置读不动绝不能让机器人起不来。风格与 pal_bot_mem5.cfg_int 一致。
+    """
+    try:
+        ev = os.environ.get("PAL_" + str(key).upper())
+        if ev is not None and str(ev).strip() != "":
+            return float(str(ev).strip())
+    except Exception:
+        pass
+    try:
+        import botcfg as _BC
+        return float(_BC.resolve(key)[0])
+    except Exception:
+        return float(default)
 
 
 def find_pal_pid():
@@ -96,11 +123,99 @@ class Mem:
                 "px": px, "py": py,
                 "K": ((px - 2 * py) // 32, (px + 2 * py - 32) // 32)}
 
+    # ------------------------------------------------------------------
+    #  只读自检: 硬编码基址在当前游戏进程里是否仍然成立 (v17.2)
+    #  动机: 这些地址是"某一次"对某个 exe 标定的。换 exe
+    #  (sdlpal.exe <-> sdlpal.hud.exe) 或换版本后, ReadProcessMemory 依然
+    #  会"成功", 但读到的是垃圾 —— 机器人会拿着假坐标瞎走几千步。
+    #  这里用 4 组互相独立的证据交叉验证, 任何一组异常都要报警。
+    # ------------------------------------------------------------------
+    MAX_SCRIPT = 43503                 # lprgScriptEntry 条数 (实测)
+
+    def selfcheck(self, report_map=None):
+        """返回 (ok, [明细行...])。不按键、不写盘。"""
+        out = []
+        W = self.raw()
+        if W is None:
+            return False, ["读取 GLOBALVARS @0x%08X 失败 (进程句柄失效?)" % READ_AT]
+        st = self.state()
+        if st is None:
+            return False, ["state() 解析失败"]
+        ok = True
+        sc = st["scene"]
+        try:
+            import psutil
+            p = psutil.Process(self.pid)
+            out.append("游戏进程 %s (pid %d) %s"
+                       % (p.name(), self.pid, p.exe() or ""))
+        except Exception:
+            pass
+        out.append("场景号=%d 队伍像素 P=(%d,%d) K=%s"
+                   % (sc, st["px"], st["py"], st["K"]))
+        if not (1 <= sc <= 300):
+            ok = False
+            out.append("★ 场景号 %d 越界 (合理 1..300) -> 基址不对" % sc)
+        if not (0 <= st["px"] < 64 * 32 and 0 <= st["py"] < 128 * 16):
+            ok = False
+            out.append("★ 队伍像素 (%d,%d) 越界 (引擎 x<2048 y<2048) -> 基址不对"
+                       % (st["px"], st["py"]))
+        po = W[IPO] | (W[IPO + 1] << 16)
+        if (po & 0xFFFF, po >> 16) != (160, 112):
+            out.append("… partyoffset=(%d,%d), 实测本版恒为 (160,112)"
+                       % (po & 0xFFFF, po >> 16))
+        # rgScene 表: 296 条里 map/脚本号合理的比例
+        off = (TABLE_ADDR - TABLE_REGION) // 2
+        good = tot = 0
+        for s in range(1, 297):
+            i = off + (s - 1) * 4
+            if i + 3 >= len(self._tw):
+                break
+            mv, s1, s2, _ev = (self._tw[i], self._tw[i + 1],
+                               self._tw[i + 2], self._tw[i + 3])
+            tot += 1
+            if mv <= 255 and (s1 <= self.MAX_SCRIPT or s1 == 0xFFFF) \
+                    and (s2 <= self.MAX_SCRIPT or s2 == 0xFFFF):
+                good += 1
+        ratio = (good / float(tot)) if tot else 0.0
+        out.append("rgScene 表 296 条中 %d 条结构合理 (%.1f%%)" % (good, ratio * 100))
+        if ratio < 0.90:
+            ok = False
+            out.append("★ 场景表结构合理率 %.1f%% < 90%% -> 基址不对" % (ratio * 100))
+        # 与解码报告对照 (最强的证据: map 号是独立来源)
+        if report_map and sc in report_map:
+            got, exp = self.scene_map.get(sc), report_map[sc]
+            out.append("场景%d 地图=%s (解码报告 %s)" % (sc, got, exp))
+            if got != exp:
+                ok = False
+                out.append("★ 场景%d 地图号与解码报告不一致 -> 基址不对" % sc)
+        return ok, out
+
 
 class MemBot:
+    # ★ 2026-09-30: 只读诊断工具 (pilot_probe / door_audit / dryrun5) 置 True。
+    #   否则 log() 会懒加载打开 bot_log_mem.txt 追加, 把诊断输出写进**正在跑的
+    #   机器人**的日志里; 而 run_report.py 用「[v13] 战斗判定」定位运行段,
+    #   会被这些假头部骗出一条假的「运行段」, 归因跟着走偏。
+    NO_LOGFILE = False
     RADIUS = 28          # 单场景探索半径(格)
     STEP_TIMEOUT = 0.55
     TAP = 0.09
+    # ---- 像素阈值: 一律用"面积比例"表达, 运行时 px_thr() 换算成像素个数 ----
+    #   (绝对值 = 标定窗口 1687x1294 下的实测值; 写字面量会被窗口缩放带偏)
+    F_ANIM_MIN = wingeom.FRAC["anim_min"]            # 300    画面在动
+    F_MENU_CHG = wingeom.FRAC["menu_chg"]            # 1500   esc 后画面变了
+    F_WALL = wingeom.FRAC["wall"]                    # 2500   完全静止 = 真墙
+    F_ANIM_BIG = wingeom.FRAC["anim_big"]            # 8000   攻击/施法动画
+    F_BATTLE_TRANS = wingeom.FRAC["battle_trans"]    # 150000 全屏级 = 战斗转场
+    # ---- 生路偏好 (2026-10-04): 寻路时给"走过很多次的格"加软代价 ----
+    #   为什么: reach() 是无权 BFS, 代价恒为 1, 所以两条怪点之间**永远走同一条
+    #   最短路** —— 同一条走廊被反复踩, 明明旁边有等长的路却一次也不走。
+    #   现在代价 = 1 + REVISIT_LAMBDA × min(visit_cnt, REVISIT_CAP):
+    #     全没走过 (visit_cnt=0) 时权重恒为 1 -> 与历史版本**逐位一致**。
+    #     REVISIT_LAMBDA=0 可当逃生开关, 直接走老的纯 BFS 分支。
+    #   调参: 加大 λ = 更愿意绕远走生路; 加大 CAP = 更不在意"到底走过几次"。
+    REVISIT_LAMBDA = 0.15
+    REVISIT_CAP = 4
 
     def __init__(self, max_battles=None, max_seconds=None, stall_limit=1200):
         self.mem = Mem()
@@ -135,6 +250,19 @@ class MemBot:
         self.doors = set()           # 当前场景门格 (预取±2圈+学习±1圈)
         self.blocked = set()         # 实测被挡格 (数据说可走但走不动)
         self.visited = set()
+        # ★ 2026-10-04 「走过几次」台账: 格 -> 踏上次数, **按场景**存
+        #   (enter_scene 里绑到 scene_know[sc]["visit_cnt"])。
+        #   用途: ① 巡逻层「访问次数最少的一档」 ② _weighted_path 的生路偏好
+        #        ③ 怪点/宝箱选点的轮转 ④ 定期探索配额。
+        #   ⚠ 别退回"全局只按 K 键" —— 不同场景共用 K 空间, 计数会串味。
+        self.visit_cnt = {}
+        # 生路偏好强度 (环境变量 PAL_REVISIT_LAMBDA / bot_config.json)
+        #   λ=0 -> bfs_path 走老的纯 BFS 分支, 行为与历史版本逐位一致。
+        self.REVISIT_LAMBDA = _cfg_float("revisit_lambda", self.REVISIT_LAMBDA)
+        try:
+            self.REVISIT_CAP = int(_cfg_float("revisit_cap", self.REVISIT_CAP))
+        except Exception:
+            pass
         self.startK = None
         self.steps = 0
         self.steps_since_battle = 0
@@ -143,7 +271,22 @@ class MemBot:
         self.migrate_cd = 0
         self.MIGRATE_COOLDOWN = 600.0     # 两次迁移尝试的最小间隔(防死循环刷屏)
         self.known_doors = self.load_doors()
+        self._door_fail = {}         # 门K -> 连续"踩了不触发"次数 (换下一个门试)
+        self._mig_why = ""           # 上次迁移未果的原因 (写日志用)
         self.last_beat = time.time()
+        # ---- 困区逃逸 (2026-09-29 熔岩走廊实测) ----
+        # 现象: 数据把链条/浮桥表面标为可走, 引擎却只在特定点让上下桥,
+        # 一片「数据可走但实测被挡」的假通路把队伍困在 ~10 格小区域里,
+        # 自愈清 2 条 -> 又撞 -> 又记, 无限循环 (单场景 3847 次实测被挡)。
+        self._trace = []             # [(t, K)] 走路采样, 供困区判定
+        self._trap_last = 0.0        # 上次困区检查时刻
+        self._trap_cd_until = 0.0    # 困区逃逸冷却
+        self._trap_goal = None       # (scene, 突围目标K, 截止时刻)
+        self._ban_warned = False     # 升级机制失效告警只打一次
+        # ---- 窗口几何 (v17.2): 像素级常量的唯一来源, 见 wingeom.py ----
+        self._geo_cache = None
+        self._geo_t = 0.0
+        self._geo_note = ""
 
     def log(self, msg):
         t = time.strftime("%H:%M:%S")
@@ -152,6 +295,8 @@ class MemBot:
             print(line, end="", flush=True)
         except Exception:
             pass
+        if self.NO_LOGFILE:          # ★ 只读诊断工具: 只到 stdout, 不落盘
+            return
         try:
             if getattr(self, "_logfh", None) is None:
                 self._logfh = open(os.path.join(BASE, "bot_log_mem.txt"), "a",
@@ -159,6 +304,40 @@ class MemBot:
             self._logfh.write(line)
         except Exception:
             pass
+
+    # ---- 窗口几何 (v17.2) ----
+    #  所有"看图"用的像素常量都从这里取, 不再硬编码。
+    #  在标定窗口 (1687x1294) 下取值与旧硬编码**逐位相同** (见 test_wingeom.py)。
+    def geo(self):
+        now = time.time()
+        if self._geo_cache is None:
+            try:
+                self._geo_cache = self.g.geom(refresh=True)
+            except Exception:
+                self._geo_cache = wingeom.legacy()
+            self._geo_t = now
+            self._geo_note = wingeom.describe(self._geo_cache)
+        elif now - self._geo_t > 30.0:
+            # 用户可能中途拖过边框: 尺寸没变则零开销, 变了就重新标定
+            self._geo_t = now
+            try:
+                old = self._geo_cache
+                new = self.g.geom_if_changed()
+                if new is not old:
+                    self.log("[几何] 窗口尺寸变化 -> 重新标定: %s"
+                             % wingeom.describe(new))
+                self._geo_cache = new
+            except Exception:
+                pass
+        return self._geo_cache
+
+    def px_thr(self, frac):
+        """面积比例 -> 当前截图下的像素个数阈值 (绝对阈值随窗口缩放自动换算)。"""
+        return wingeom.px_thr(frac, wingeom.area(self.geo()))
+
+    def band0(self):
+        """is_battle 波段顶 (像素行); 窗口缩放后仍需圈住视口底部。"""
+        return wingeom.band_top(self.geo())
 
     # ---- 场景/地图 ----
     def kwalk(self, m):
@@ -183,6 +362,7 @@ class MemBot:
     ESCALATE_AFTER = 3           # 同一格短窗口内被挡 N 次 -> 升级长期禁入
     ESCALATE_WINDOW = 600.0      # 升级计数窗口 (秒); 超窗重新计数, 防误封游走NPC路过格
     ESCALATE_TTL = 1800.0        # 长期禁入持续时间 (秒), 到期自动解除
+    EXIT_BAN_TTL = 300.0         # 「仅剩出口」格被反复撞后的短禁入时长(秒)
 
     def _exit_count(self, cur):
         """当前位置还剩几个可走出口 (4 邻中在可走域且未被禁的格数)。"""
@@ -203,11 +383,19 @@ class MemBot:
         30 分钟后自动解除 —— 临时阻挡物走后地图自动复原)。"""
         hits = getattr(self, "blocked_hits", None)
         if hits is None or not hasattr(self.blocked, "ts"):
+            if not getattr(self, "_ban_warned", False):
+                self._ban_warned = True
+                self.log("[绕行] 警告: 升级机制不可用 (blocked_hits=%s, "
+                         "blocked=%s) -> 撞墙知识只会 70s 过期, 不会升级"
+                         % (type(hits).__name__, type(self.blocked).__name__))
             return
-        # ★ 出口保护: 相邻格若是当前位置仅剩的出口之一, 绝不升级为长期禁入。
-        #   实测事故: 场景157 窄路上唯一两个出口都被升级 -> reach(cur) 只剩自己,
-        #   候选永远为空, 原地空转 50 分钟 (1068 次"候选为空") 只赢 1 场。
-        #   移动能力优先于避让 —— 宁可再撞一次, 也不能把自己锁死。
+        # ★ 出口保护 v2 (2026-09-29 桥区实测教训): 原来对"仅剩出口"直接放行
+        #   (绝不升级) —— 但锁妖塔窄桥上相邻格几乎全是"仅剩出口", 每格每
+        #   BLOCK_TTL(70s) 就重撞一次 (单场景日志 384 次「仅剩的出口」),
+        #   与 RESET 清绕行形成死循环 -> 吞吐 0.03 格/秒。
+        #   现改为「短禁入」: 同格 3 次被挡 -> 只禁 EXIT_BAN_TTL(5 分钟, 非
+        #   30 分钟长期禁入); 禁完若当前位置一个出口都不剩, 立即撤销 ——
+        #   移动能力仍然优先, 但"此路不通"能被记住 5 分钟。
         try:
             cur = self.mem.state()["K"]
         except Exception:
@@ -215,8 +403,28 @@ class MemBot:
         if cur is not None and \
                 max(abs(cell[0] - cur[0]), abs(cell[1] - cur[1])) <= 1 and \
                 self._exit_count(cur) <= 1:
-            self.log("[绕行] K%s 是当前位置仅剩的出口 -> 只记临时绕行, 不长期禁入"
-                     % (cell,))
+            now2 = time.time()
+            cnt, last = hits.get(cell, (0, 0.0))
+            if now2 - last > self.ESCALATE_WINDOW:
+                cnt = 0
+            cnt += 1
+            hits[cell] = (cnt, now2)
+            if cnt >= self.ESCALATE_AFTER:
+                if cell not in self.blocked:
+                    self.blocked.add(cell)
+                self.blocked.ts[cell] = now2 + self.EXIT_BAN_TTL
+                self._pc_key = None
+                if self._exit_count(cur) == 0:
+                    # 真的会把自己锁死 -> 撤销 (discard 会连 ts 一起清,
+                    # 下次被挡重新计数; 效果退化为旧行为, 不会更糟)
+                    self.blocked.discard(cell)
+                    self.log("[绕行] K%s 短禁入会让当前位置无路可走 -> 撤销"
+                             % (cell,))
+                else:
+                    self.log("[绕行] K%s 仅剩出口但 %d 分钟内被挡 %d 次 "
+                             "-> 短禁入 %.0f 分钟"
+                             % (cell, self.ESCALATE_WINDOW // 60, cnt,
+                                self.EXIT_BAN_TTL // 60))
             return
         now = time.time()
         cnt, last = hits.get(cell, (0, 0.0))
@@ -276,6 +484,8 @@ class MemBot:
     def enter_scene(self, sc, why=""):
         self.scene = sc
         self.map = self.mem.scene_map.get(sc)
+        self._trace = []             # 换场景后旧坐标没有可比性
+        self._trap_goal = None
         st = self.scene_know.get(sc)
         cur = self.mem.state()["K"]
         if st is None:
@@ -291,6 +501,10 @@ class MemBot:
         self.doors = st["doors"]
         self.blocked = st["blocked"]
         self.visited = st["visited"]
+        # ★ 2026-10-04: 「走过几次」按场景绑定。用 setdefault 而不是 st[...] ——
+        #   handle_door/开门模式会用 setdefault(sc, {"doors": set()}) 造出
+        #   只带 doors 的残缺 st, 老场景回来时不会走上面的创建分支。
+        self.visit_cnt = st.setdefault("visit_cnt", {})
         self.startK = st["startK"]
         self.blocked_hits = st.setdefault("blocked_hits", {})
         ks = self.kwalk(self.map) if self.map is not None else set()
@@ -333,7 +547,7 @@ class MemBot:
 
     def fight(self):
         """战斗处理 (照搬验证过的 v11 逻辑): F 连击直到脱战, 3 次确认。"""
-        self.log("[战斗] 交战, 按 F 最强法术")
+        self.log("[战斗] 交战, 按 %s 最强法术" % PB.attack_key())
         t0 = time.time()
         fought = False
         while time.time() - t0 < 180.0:
@@ -349,7 +563,7 @@ class MemBot:
                 continue
             fought = True
             t0 = time.time()                 # 还在打: 重置超时
-            self.g.key("f")
+            self.g.attack()
             time.sleep(1.1)
         self.g.flush_keys()
         if fought:
@@ -380,10 +594,15 @@ class MemBot:
         return False
 
     # ---- 路径 ----
-    def bfs_path(self, src, dsts, extra_blocked=frozenset(), allow_doors=False):
-        """解码可走域 BFS: 从 src 到 dsts 中任一格的最短路 (门格/实测挡格除外)。"""
+    def bfs_path(self, src, dsts, extra_blocked=frozenset(), allow_doors=False,
+                 relax_blocked=False):
+        """解码可走域 BFS: 从 src 到 dsts 中任一格的最短路 (门格/实测挡格除外)。
+
+        relax_blocked=True: 忽略「绕行」标记再算一次 (mem2 覆写版同款语义)。
+        """
         ks = self.kwalk(self.map)
-        bad = self.blocked | set(extra_blocked) if allow_doors else self.doors | self.blocked | set(extra_blocked)
+        blk = set() if relax_blocked else self.blocked
+        bad = blk | set(extra_blocked) if allow_doors else self.doors | blk | set(extra_blocked)
         dsts = set(dsts) - bad
         if not dsts or src not in ks:
             return None
@@ -406,6 +625,47 @@ class MemBot:
                     q.append(t)
         return None
 
+    # ---- 加权最短路 (生路偏好, 2026-10-04) ----
+    def _weighted_path(self, src, dst, bad, lam):
+        """Dijkstra 单目标最短路, 代价 = 1 + lam×min(visit_cnt, REVISIT_CAP)。
+
+        为什么要有它: reach()/BFS 是无权的, 两条怪点之间**永远走同一条最短路**,
+        旁边等长的路一次也不走。给"走过很多次的格"加软代价之后, 只有等长或
+        近似长度的生路才会被选中 —— 目标选择完全不变, 所以刷怪密度不受影响。
+
+        visit_cnt 全空 (开局/影子对象) 时权重恒为 1 -> 与纯 BFS 同解。
+        目标就是"要走过去的那一格", 所以一旦弹出 dst 就早退 —— 近距离目标
+        比老的整图泛洪还便宜。
+        """
+        ks = self.kwalk(self.map)
+        if src not in ks or dst in bad or dst not in ks:
+            return None
+        vc = getattr(self, "visit_cnt", None) or {}
+        cap = self.REVISIT_CAP
+        prev = {src: None}
+        dist = {src: 0.0}
+        heap = [(0.0, src)]
+        while heap:
+            d0, p = heapq.heappop(heap)
+            if d0 > dist.get(p, 1e18):
+                continue                     # 堆里的陈旧条目
+            if p == dst:
+                path = []
+                while p is not None:
+                    path.append(p)
+                    p = prev[p]
+                return path[::-1]
+            for d in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                t = (p[0] + d[0], p[1] + d[1])
+                if t not in ks or t in bad:
+                    continue
+                nd = d0 + 1.0 + lam * min(vc.get(t, 0), cap)
+                if nd < dist.get(t, 1e18) - 1e-9:
+                    dist[t] = nd
+                    prev[t] = p
+                    heapq.heappush(heap, (nd, t))
+        return None
+
     def walk_path(self, path):
         """沿路径走, 每步内存核实; 偏离/被挡返回 False (调用方重规划)。"""
         for i in range(1, len(path)):
@@ -416,6 +676,10 @@ class MemBot:
                 self.log("[MEM] walk_path 检测到 mem_stop.flag -> 中止路径")
                 return False
             cur = self.mem.state()["K"]
+            # 困区逃逸的采样: 每步(含被挡步)都记录位置, 6 分钟窗口
+            self._trace.append((time.time(), cur))
+            if len(self._trace) > 4000:
+                del self._trace[:2000]
             if cur != path[i - 1]:
                 return False                     # 位置漂移(战斗/意外): 重规划
             d = (path[i][0] - cur[0], path[i][1] - cur[1])
@@ -442,6 +706,13 @@ class MemBot:
                     self.log("[MEM] 实测被挡(数据说可走): %s -> 记入绕行" % (path[i],))
                 return False
             self.visited.add(K1)
+            # ★ 2026-10-04 「走过几次」在这里记账 —— 只有**真的踏上去**才 +1。
+            #   以前这行只在 MemBot4.pick_target 里, 而主模式(要素巡回)压根不走
+            #   那个分支 -> visit_cnt 在主模式下永远是空的, 所有"避重/探索"信号
+            #   全是死的。getattr 兜底: 裸影子对象没有这个字段。
+            _vc = getattr(self, "visit_cnt", None)
+            if _vc is not None:
+                _vc[K1] = _vc.get(K1, 0) + 1
             self.steps += 1
             self._last_move_t = time.time()
             self.steps_since_battle += 1
@@ -533,34 +804,69 @@ class MemBot:
         self.known_doors.setdefault(sc, set()).add(K)
         self.save_doors()
 
+    # ★ 2026-09-30: 门距上限写死 80 会把"角落的门"静默排除。
+    #   场景 157 实测: 用户指认的"右下角出口门" K(-96,132) 距起点 82 格,
+    #   于是迁移永远只去 K(-21,63)/K(30,66) 两个门, 那两个门踩了不触发 ->
+    #   一整轮 13 次换场景尝试 0 成功, 白烧约 20% 的日志活动。
+    MIGRATE_DOOR_MAX = 200
+    DOOR_FAIL_MAX = 2         # 同一门连续失败 N 次 -> 先换下一个门试
+
     def pick_migrate_door(self, cur):
-        """迁移目标门: 预取门 + 历史实测门(跨运行持久), 取最近且有可走邻格的。"""
+        """迁移目标门: 预取门 + 历史实测门(跨运行持久), 取最近且有可走邻格的。
+
+        连续失败 DOOR_FAIL_MAX 次的门先跳过; 全都被跳过时清空失败史重来
+        (避免把用户真正想去的门永久拉黑)。
+        """
+        def _d(d):
+            return max(abs(d[0] - cur[0]), abs(d[1] - cur[1]))
         ks = self.kwalk(self.map)
-        cands = list(self.report_doors.get(self.scene, set())) + \
-            list(self.known_doors.get(self.scene, set()))
-        cands = [d for d in cands
-                 if max(abs(d[0] - cur[0]), abs(d[1] - cur[1])) <= 80]
-        cands.sort(key=lambda d: max(abs(d[0] - cur[0]), abs(d[1] - cur[1])))
-        for d in cands:
+        cands = list(set(self.report_doors.get(self.scene, ())) |
+                     set(self.known_doors.get(self.scene, ())))
+        cands = [d for d in cands if _d(d) <= self.MIGRATE_DOOR_MAX]
+        cands.sort(key=_d)
+        fail = getattr(self, "_door_fail", None)
+        if fail is None:
+            fail = self._door_fail = {}
+        ok = [d for d in cands if fail.get(d, 0) < self.DOOR_FAIL_MAX]
+        if not ok and cands:
+            fail.clear()
+            ok = cands
+        for d in ok:
             if any((d[0] + da, d[1] + db) in ks
                    for da in (-1, 0, 1) for db in (-1, 0, 1)):
                 return d
         return None
 
     def migrate_probe(self, doorK):
-        """走到门 K 的可走邻格, 再在 ±2 邻域内逐格试踩门。返回是否触发换图。"""
+        """走到门 K 的可走邻格, 再在 ±2 邻域内逐格试踩门。返回是否触发换图。
+
+        ★ 2026-09-30: 失败原因必须写日志。原实现静默返回 False, 结果 10 次
+          "门未触发" 在 1 秒内刷完 (根本没走路), 完全看不出卡在哪一步。
+        """
         ks = self.kwalk(self.map)
+        self._mig_nopath = False
         near = [(a, b) for (a, b) in ks
                 if abs(a - doorK[0]) <= 2 and abs(b - doorK[1]) <= 2
                 and (a, b) not in self.blocked]
+        if not near:
+            self._mig_why = "门外 ±2 无可走格 (全被绕行禁掉?)"
+            self._mig_nopath = True
+            return False
         cur0 = self.mem.state()["K"]
         near.sort(key=lambda c: max(abs(c[0] - cur0[0]), abs(c[1] - cur0[1])))
+        n_nopath = 0
+        n_tried = 0
         for cell in near:
             cur = self.mem.state()["K"]
             if cur != cell:
                 path = self.bfs_path(cur, {cell}, allow_doors=True)
-                if path is None or not self.walk_path(path):
+                if path is None:
+                    n_nopath += 1
                     continue
+                if not self.walk_path(path):
+                    n_nopath += 1
+                    continue
+            n_tried += 1
             for d in ("up", "right", "down", "left"):
                 st, K0, K1, sc1 = self.step(d)
                 if st == "door":
@@ -576,7 +882,24 @@ class MemBot:
                     if sc2 != self.scene:
                         self.enter_scene(sc2, "(迁移穿门)")
                         return True
+        self._mig_nopath = (n_tried == 0)   # 一次键都没按 -> 不算「试过」
+        self._mig_why = ("到了门外 %d 格逐个踩 4 方向都没换图" % n_tried
+                         if n_tried else "门外 %d 格全走不进去 (无路/被挡)" % n_nopath)
         return False
+
+    def _migrate_failed(self, door, why):
+        """迁移未果: 记该门失败次数 + 通知调度器退避 (覆写点)。"""
+        fail = getattr(self, "_door_fail", None)
+        if fail is None:
+            fail = self._door_fail = {}
+        fail[door] = fail.get(door, 0) + 1
+        self.log("[MEM] 迁移: 门 K%s 记失败 %d 次 (%s)"
+                 % (door, fail[door], why))
+
+    def _on_migrate_end(self, success):
+        """迁移分支收尾钩子 (覆写点)。success=False -> 子类可让调度器退避。"""
+        pass
+
 
     def tick(self):
         cur = self.mem.state()["K"]
@@ -586,6 +909,7 @@ class MemBot:
             self.log("[MEM] 迁移: %d 步无战斗, 穿门找刷怪区" % self.steps_since_battle)
             sc0 = self.scene
             door = self.pick_migrate_door(cur)
+            ok_mig = False
             if door is None:
                 self.log("[MEM] 迁移: 本场景无已知门, 放弃本轮")
                 self.migrate = False
@@ -595,17 +919,39 @@ class MemBot:
                     self.log("[MEM] 迁移成功: 场景 %d -> %d" % (sc0, self.scene))
                     self.migrate = False
                     self._mtries = 0
+                    ok_mig = True
                 else:
-                    self._mtries = getattr(self, "_mtries", 0) + 1
-                    self.log("[MEM] 迁移: 门未触发(第%d次), 跨轮继续逼近" % self._mtries)
-                    if self._mtries < 10:
-                        return                  # 保持 migrate=True, 下一轮接着逼近
-                    self.log("[MEM] 迁移: 尝试%d次未果, 进入冷却" % self._mtries)
-                    self._mtries = 0
-                    self.migrate = False
+                    why = getattr(self, "_mig_why", "未知")
+                    if getattr(self, "_mig_nopath", False):
+                        # ★ 2026-09-30: 一次键都没按 (门邻格全部 bfs 无路;
+                        #   典型是可达域被误记的「被挡」压塌了) -> 不叫「试过一次」。
+                        #   旧实现照样计数, 于是 10 次「重试」在 1 秒内刷完
+                        #   (实测 12:03:15 / 12:06:10 / 12:09:07 各 x10, 一步都没走),
+                        #   日志看着像在重试, 实际是空转。
+                        self.log("[MEM] 迁移: 门 K%s 当前不可达 (原因: %s)"
+                                 " -> 放弃本轮 (未按键, 不计入重试)" % (door, why))
+                        self._migrate_failed(door, why)
+                        self._mtries = 0
+                        self.migrate = False
+                    else:
+                        self._mtries = getattr(self, "_mtries", 0) + 1
+                        self.log("[MEM] 迁移: 门未触发(第%d次), 跨轮继续逼近；原因: %s"
+                                 % (self._mtries, why))
+                        self._migrate_failed(door, why)
+                        if self._mtries < 10:
+                            return              # 保持 migrate=True, 下一轮接着逼近
+                        self.log("[MEM] 迁移: 尝试%d次未果, 进入冷却" % self._mtries)
+                        self._mtries = 0
+                        self.migrate = False
             if not self.migrate:
-                self.migrate_cd = time.time() + self.MIGRATE_COOLDOWN
+                # ★ 只有"没换成"才进冷却。成功换场景由新场景自己重新判 (原实现
+                #   无条件设冷却, 但除了 NO_MONSTER 分支没人读它, 所以无影响;
+                #   现在 _pilot_tick 会读, 必须区分成功/失败, 否则换到好场景反而
+                #   被锁 10 分钟不让走)。
+                if not ok_mig:
+                    self.migrate_cd = time.time() + self.MIGRATE_COOLDOWN
                 self.steps_since_battle = 0
+                self._on_migrate_end(ok_mig)      # 覆写点: 失败则让调度器退避
             return
         tgt = self.pick_target()
         if tgt is None:
@@ -625,18 +971,38 @@ class MemBot:
             self._spin = getattr(self, "_spin", 0) + 1
             if self._spin % 80 == 0:
                 # 绕行知识过密把局部地图糊死 -> 清掉周边污染, 换锚点重新测绘
-                cur = self.mem.state()["K"]
-                cleared = 0
-                for c in list(self.blocked):
-                    if max(abs(c[0] - cur[0]), abs(c[1] - cur[1])) <= 16:
+                # ★ 2026-09-29 桥区教训: 原来无差别清除 —— 被反复实测挡住
+                #   的真知识也被清掉 -> BFS 又说能走 -> 再撞 -> 再 RESET,
+                #   单场景 174 次 RESET / 0.03 格/秒。现改为:
+                #   ① 2 分钟内不重复 RESET  ② 长期/短期禁入格(升级过的)不清
+                #   ③ 60 秒内被挡 ≥2 次的格(可能是菜单毒化, 但更可能是真挡)不清
+                now_r = time.time()
+                if now_r - getattr(self, "_last_reset_t", 0.0) < 120.0:
+                    self._spin = 0
+                else:
+                    self._last_reset_t = now_r
+                    cur = self.mem.state()["K"]
+                    hits = getattr(self, "blocked_hits", {})
+                    cleared = 0
+                    kept = 0
+                    for c in list(self.blocked):
+                        if max(abs(c[0] - cur[0]), abs(c[1] - cur[1])) > 16:
+                            continue
+                        if self._is_perm(c):
+                            kept += 1
+                            continue
+                        if hits.get(c, (0, 0.0))[0] >= 2:
+                            kept += 1
+                            continue
                         self.blocked.discard(c)
                         cleared += 1
-                self.startK = cur
-                self.visited = {c for c in self.visited
-                                if max(abs(c[0] - cur[0]), abs(c[1] - cur[1])) <= 6}
-                self._spin = 0
-                self.log("[MEM] RESET 局部绕行知识过密 -> 清除周边 %d 格并重新测绘 K%s"
-                         % (cleared, cur))
+                    self.startK = cur
+                    self.visited = {c for c in self.visited
+                                    if max(abs(c[0] - cur[0]),
+                                           abs(c[1] - cur[1])) <= 6}
+                    self._spin = 0
+                    self.log("[MEM] RESET 局部绕行知识 -> 清 %d 格(保留真知识 "
+                             "%d 格) 重新测绘 K%s" % (cleared, kept, cur))
             time.sleep(0.15)          # 防 100% CPU 空转 (曾被宿主判异常清掉)
             return
         if not self.walk_path(path):
@@ -673,7 +1039,49 @@ class MemBot:
         except Exception as e:
             self.log("[MEM] 启动自检失败: %s" % e)
 
+    STALE_STOP_GRACE = 60.0     # 标志比启动时刻早这么多秒 -> 判为陈旧遗留
+
+    def _clear_stale_stop(self):
+        """启动时清掉上一轮遗留的 mem_stop.flag (返是否清了)。
+
+        mem_stop.flag 不会被自动清理: 上一轮被强杀后残留的标志会让这次启动
+        **立刻**走「检测到 mem_stop.flag, 收键退出」, 看着像「跑不起来」。
+        判据用启动时刻 —— mtime 早于 _t_boot-GRACE 才算陈旧, 所以运行期间
+        别人写的停止标志 (mtime 必然更晚) 不受影响, 正常停机语义不变。
+        """
+        p = os.path.join(BASE, "mem_stop.flag")
+        try:
+            if os.path.exists(p) and \
+                    os.path.getmtime(p) < getattr(self, "_t_boot", 0) \
+                    - self.STALE_STOP_GRACE:
+                os.remove(p)
+                self.log("[MEM] 清掉上一轮遗留的"
+                         " mem_stop.flag (陈旧标志, 否则一启动就退出)")
+                return True
+        except OSError:
+            pass
+        return False
+
     def run(self):
+        self._t_boot = time.time()
+        # ★ 2026-09-30: mem_stop.flag 不会被自动清理。上一轮被强杀后残留的
+        #   标志会让这次启动**立刻**退出 (看着像「跑不起来」)。判据用启动
+        #   时刻: mtime 早于 _t_boot-60s 才算陈旧, 所以运行期间别人写的停止
+        #   标志 (mtime 必然更晚) 不受影响, 正常停机语义不变。
+        self._clear_stale_stop()
+        # ---- 启动校验①: 硬编码内存基址是否对得上当前 exe ----
+        ok, det = self.mem.selfcheck(self.report_map)
+        for ln in det:
+            self.log("[校验] %s" % ln)
+        if not ok and os.environ.get("PAL_ALLOW_MEM_MISMATCH", "").lower() \
+                not in ("1", "true", "on", "yes"):
+            self.log("[校验] ★ 内存基址与当前游戏进程对不上 -> 不按键直接停机")
+            self.log("[校验] 常见原因: 换了 exe / 游戏升级。换回标定的那个 exe, "
+                     "或先跑 python tools/env_check.py 诊断")
+            return
+        self.geo()                        # 窗口几何自标定 (顺带补一次日志)
+        self.log("[几何] %s" % (self._geo_note or "未取到"))
+        self.log("[校验] 内存基址 OK: 场景表/坐标/报告三方一致")
         s = self.mem.state()
         self.enter_scene(s["scene"], "(启动)")
         self.g.flush_keys()

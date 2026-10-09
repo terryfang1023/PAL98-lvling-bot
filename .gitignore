@@ -11,7 +11,22 @@ mem_stop.flag
 .pal_bot.lock
 hotspot.json
 mem_doors.json
+scene_links.json
 *.log
+
+# 用户偏好 (GUI 里调的攻击键等) —— 每台机器不同, 不入库
+bot_config.json
+
+# 跑出来的台账 (已开过的箱子) —— 每台机器/每个存档不同, 不入库
+chest_log.json
+
+# 跑出来的要素台账 / 累计总胜场 / 清空标志 / 覆盖率报告 (v19.0)
+#   —— 全是运行产物, 每台机器不同, 不入库
+feat_log.json
+win_total.json
+win_reset.flag
+feat_report.txt
+feat_report.json
 
 # 诊断截图
 *.png
@@ -40,5 +55,9 @@ dist/
 /stat*.txt
 /t5.txt
 /o?.json
-/objects_dump.json
+/objects_dump*.json
 /scene_info.json
+/scene_score.json
+
+# 绳子攀爬失败的现场截图 (v18.3 诊断, 机器人自动清理)
+/_diag_rope/

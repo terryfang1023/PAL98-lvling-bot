@@ -18,7 +18,9 @@ SCENE, MAP, CUR = 157, 156, (-46, 140)      # 事故现场 (熔岩锁链窄路)
 EXITS = [(-45, 140), (-47, 140)]            # 数据上仅有的两个出口
 
 print("=" * 64)
-print("T1  出口保护: 相邻格若是仅剩出口 -> 拒绝升级长期禁入")
+print("T1  出口保护: 仅剩出口被反复撞 -> 只给「短禁入」不给 30 分钟长期禁入")
+print("     (2026-09-29 v2: 旧行为「绝不升级」在锁妖塔窄桥上每 70 秒重撞一次,")
+print("      与 RESET 清绕行形成死循环 -> 吞吐 0.03 格/秒, 故改为短禁入)")
 print("=" * 64)
 
 
@@ -64,10 +66,25 @@ print("初始出口数:", b._exit_count(CUR), "(应为 2)")
 for i in range(3):
     b.blocked.add(EXITS[0])
     b._ban_escalate(EXITS[0])
-print("把出口1 (-45,140) 连续被挡 3 次后: is_perm =", b._is_perm(EXITS[0]),
-      "(应为 False, 被出口保护拦住)")
-assert not b._is_perm(EXITS[0]), "仅剩出口不该被升级"
+ttl = b.blocked.ts.get(EXITS[0], 0) - time.time()
+print("出口1 (-45,140) 连续被挡 3 次后: 剩余禁入 %.0f 秒 (应约 %d 秒短禁入; "
+      "长期禁入是 %.0f 秒)" % (ttl, MemBot.EXIT_BAN_TTL, MemBot.ESCALATE_TTL))
+assert 0.5 * MemBot.EXIT_BAN_TTL < ttl <= MemBot.EXIT_BAN_TTL + 5, \
+    "仅剩出口应升级为 %d 秒短禁入, 实际 %.0f" % (MemBot.EXIT_BAN_TTL, ttl)
+assert ttl < MemBot.ESCALATE_TTL - 60, "不该给 30 分钟长期禁入 (出口保护)"
 print("T1 PASS\n")
+
+print("=" * 64)
+print("T1b 出口保护兜底: 短禁入会把当前位置彻底锁死 -> 立即撤销")
+print("=" * 64)
+b = mkbot(perm_cells=[EXITS[1]])       # 另一个出口已长期禁入
+for i in range(3):
+    b.blocked.add(EXITS[0])
+    b._ban_escalate(EXITS[0])
+print("两个出口都不可用时, 出口1 是否仍被禁:", EXITS[0] in b.blocked,
+      "(应为 False, 移动优先)")
+assert EXITS[0] not in b.blocked, "会让当前位置无路可走的短禁入必须撤销"
+print("T1b PASS\n")
 
 print("=" * 64)
 print("T2  正常情况(出口充足) -> 升级照常生效")
