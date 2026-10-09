@@ -28,9 +28,12 @@ win_reset.flag
 feat_report.txt
 feat_report.json
 
-# 诊断截图
+# 诊断截图 (机器人自动留档的现场图, 不入库)
 *.png
 *.jpg
+
+# 但 README 用的配图要入库 (这一条必须排在 *.png 之后)
+!docs/images/*.png
 
 # Python
 __pycache__/
