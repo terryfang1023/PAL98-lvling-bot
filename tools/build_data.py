@@ -11,16 +11,14 @@
 
 <游戏目录> 需包含:
     SSS.MKF / MAP.MKF / GOP.MKF   仙剑98柔情版游戏资源 (用户自备)
-    yj2.dll                        YJ_2 解压动态库, 来自开源项目 SDLPAL
-                                   (https://github.com/sdlpal/sdlpal, GPL),
-                                   自行编译或从其发行包获取, 放到游戏目录
-                                   或本 tools 目录均可。
+
+★ 不需要任何外部动态库: MAP.MKF 的 YJ_2 解压已移植为纯 Python
+  (`tools/yj2.py`, 移植自 SDLPAL yj2dll.c); SSS.MKF 走 `tools/mkf.py` 的 YJ_1。
+  (2026-10-15 之前这里要用户自备 yj2.dll, 现已彻底去掉 —— 新机器只需游戏本体。)
 
 约需 10~60 秒 (取决于磁盘速度)。
 """
-import ctypes
 import os
-import re
 import struct
 import sys
 import time
@@ -29,18 +27,9 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mkf import MKF                     # noqa: E402
+from yj2 import yj2_decompress          # noqa: E402
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # 仓库根
-
-
-def find_yj2dll(game):
-    for p in (os.path.join(game, "yj2.dll"),
-              os.path.join(HERE, "yj2.dll"),
-              os.path.join(HERE, "tools", "yj2.dll"),
-              os.path.join(game, "_src", "sdlpal", "yj2.dll")):
-        if os.path.exists(p):
-            return p
-    return None
 
 
 def main():
@@ -49,23 +38,9 @@ def main():
         if not os.path.exists(os.path.join(game, f)):
             print("错误: %s 下缺少 %s" % (game, f))
             sys.exit(1)
-    dllpath = find_yj2dll(game)
-    if not dllpath:
-        print("错误: 找不到 yj2.dll (YJ_2 解压库)。\n"
-              "请从开源项目 SDLPAL (github.com/sdlpal/sdlpal) 编译获取,\n"
-              "放到游戏目录或本仓库目录。详见 README.md。")
-        sys.exit(1)
-    dll = ctypes.CDLL(dllpath)
-    dll.yj2_decompress.argtypes = [ctypes.c_char_p, ctypes.c_char_p,
-                                   ctypes.c_int]
-    dll.yj2_decompress.restype = ctypes.c_int
-    _buf = ctypes.create_string_buffer(65536 + 64)
 
     def yj2(raw):
-        n = dll.yj2_decompress(raw, _buf, 65536 + 64)
-        if n <= 0:
-            raise ValueError("yj2 fail %d" % n)
-        return _buf.raw[:n]
+        return yj2_decompress(raw)
 
     os.chdir(HERE)
     t0 = time.time()

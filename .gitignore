@@ -17,6 +17,9 @@ scene_links.json
 # 用户偏好 (GUI 里调的攻击键等) —— 每台机器不同, 不入库
 bot_config.json
 
+# 一键启动记住的游戏目录 (start_bot.bat / tools/first_run.py) —— 每台机器不同
+game_dir.txt
+
 # 跑出来的台账 (已开过的箱子) —— 每台机器/每个存档不同, 不入库
 chest_log.json
 

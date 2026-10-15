@@ -267,7 +267,10 @@
 |---|---|---|---|
 | **整套游戏资源**<br>`SSS.MKF` `MAP.MKF` `GOP.MKF`<br>（`DATA.MKF` `WORD.DAT` 用于显示怪名/物品名） | ① 游戏本身要运行<br>② 生成全图可走域与要素清单 | 你自己的正版《仙剑98柔情版》拷贝 | 游戏目录 |
 | **`sdlpal.exe`** | 开源 [SDLPAL](https://github.com/sdlpal/sdlpal) 引擎，**窗口标题必须含 `Pal`** | 自行编译 SDLPAL，或用你已有的构建 | 游戏目录 |
-| **`yj2.dll`** | YJ_2 图片/地图解压库，`build_data.py` 生成全图可走域必须用 | SDLPAL 的 `yj2dll.c` 编译产物，或从其发行包取得 | 游戏目录根下、`游戏目录\_src\sdlpal\`、或机器人目录 —— **这三个位置都会自动找** |
+
+> ✅ **不再需要 `yj2.dll`**（v0.2.0-beta 起）：地图用的 YJ_2 解压已经内建为纯 Python
+> （`tools/yj2.py`，移植自 SDLPAL `yj2dll.c`，223 张地图与当年的 DLL 逐字节对拍一致）。
+> 所以新机器上**你只需要准备游戏本体**，不用再去找/编译任何动态库。
 
 目录摆放建议（把机器人目录放在游戏目录**里面**，工具就能自动找到游戏资源）：
 
@@ -275,8 +278,8 @@
 D:\Game\PAL98\                    ← 游戏目录
 ├── sdlpal.exe
 ├── SSS.MKF   MAP.MKF   GOP.MKF   DATA.MKF   WORD.DAT
-├── _src\sdlpal\yj2.dll           ← 或者直接放在这个目录根下
 └── pal98-bot\                    ← 本仓库（git clone 到这里）
+    ├── start_bot.bat               ← 双击我
     ├── bot_gui.py  pal_bot_mem5.py  ...   ← 代码
     ├── map_walk.npy  scene_info.json  ... ← 生成物, 不入库
     └── bot_log_mem.txt  feat_log.json ... ← 运行产物, 不入库
@@ -288,21 +291,36 @@ D:\Game\PAL98\                    ← 游戏目录
 改名成 `pal98-bot` 随意）。也可以 `git clone` —— 区别只有一个：clone 的以后能
 `git pull` 拉更新，ZIP 是一次性快照，要更新得重新下。
 
-ZIP / clone 里**只有 78 个文件**（`.py` / `.md` / 配图 / `LICENSE` / `requirements.txt`），
+ZIP / clone 里**只有 84 个文件**（`.py` / `.md` / `.bat` / 配图 / `LICENSE` / `requirements.txt`），
 **不含**游戏资源，**也不含** `map_walk.npy` / `scene_info.json` 等生成物 ——
-所以新机器上还要做三件事：
+所以新机器上还要做三件事 —— **但不用手敲，双击 `start_bot.bat` 就行**：
+
+```cmd
+:: 推荐：双击 start_bot.bat（或在命令行里跑），它会依次做完下面 1~3 步
+::   ① 缺哪个依赖装哪个   ② 自己找游戏目录（找不到才问一次，之后记住）
+::   ③ 缺哪个数据生成哪个  ④ 顺手帮你启动游戏  ⑤ 打开机器人界面
+start_bot.bat
+```
+
+想手敲（或排查问题）时，等价的手工三件事是：
 
 ```bash
-# 1. 装依赖（需要 64 位 Python 3.10+；tkinter 随 Python 自带, 不用单独装）
+# 1. 装依赖（需要 Python 3.9+，建议 64 位；tkinter 随 Python 自带, 不用单独装）
 pip install -r requirements.txt
 
 # 2. 把游戏资源拷过来（或指向已有的那份游戏目录）, 然后生成数据
-python tools/build_data.py "D:\你的游戏目录"        # 约 10~60 秒, 需要 yj2.dll
+python tools/build_data.py "D:\你的游戏目录"        # 约 15 秒, 不需要任何 DLL
 python tools/build_scene_info.py --game "D:\你的游戏目录"   # 约 2 秒
+python tools/scene_score.py                          # 可选, 约 20 秒
 
 # 3. 启动
 python bot_gui.py
 ```
+
+> 🖱️ **`start_bot.bat` 是幂等的**：第二次双击时依赖已就绪、数据已生成，
+> 约 2 秒直达界面。它只做上面这些事 —— 不碰你的台账、不会自动开始挂机
+> （开始/停止仍然在界面里点）。想只做前置不开界面：`start_bot.bat --no-launch`；
+> 想后台启动（窗口可直接关掉）：`start_bot.bat --detach`。
 
 > 💡 **最省事的搬法：把生成物直接拷过去。** 生成物只取决于游戏资源，两台机器的
 > 游戏资源是**同一版本**时，拷过去就能用，**不用重跑 `build_data.py`**（省掉 10~60 秒，
@@ -329,11 +347,11 @@ python bot_gui.py
 
 | 谁在找 | 搜索顺序 | 认 `PAL_GAME_DIR` 吗 |
 |---|---|---|
+| **一键启动 `tools/first_run.py`** | `--game` → `PAL_GAME_DIR` → `game_dir.txt`（上次记住的）→ 仓库根/上一级/上两级 → 问你 | ✅ |
 | 地图数据 `tools/build_data.py` | 命令行参数；**省略时默认 = 仓库的上一级目录** | ❌ |
 | 要素清单 `tools/build_scene_info.py` | `--game 参数` → 环境变量 `PAL_GAME_DIR` → 从 `tools/` 向上 **5 级** | ✅ |
 | 物品名 / 人物名 `bot_itemmon.py` | 仓库根 → 上一级 → 上二级（找 `WORD.DAT`） | ❌ |
 | 窗口等比参数 `wingeom.py` | 仓库根 → 上一级 → 上二级（找 `sdlpal.cfg`） | ❌ |
-| `yj2.dll` | 游戏目录 → 仓库根 → `tools\` → `游戏目录\_src\sdlpal\` | ❌ |
 
 **所以最省事的摆法就是上面那张目录图：把 `pal98-bot\` 直接放进取游戏目录里**，
 所有搜索都能命中，包括界面上的「刷新怪点/宝箱」按钮（它不带 `--game`，全靠自动搜索）。
@@ -355,8 +373,12 @@ setx PAL_GAME_DIR "D:\别处的游戏目录"
 
 ### 三步验证（照顺序做）
 
+> 其实这三步（以及装依赖）就是 `start_bot.bat` 自动做的事 —— 双击它 = 跑完 ①②，
+> 然后开界面。下面列出来是给"想手动确认每一步"的人看的。
+
 ```bash
-# ① 生成地图数据 —— 需要 SSS.MKF / MAP.MKF / GOP.MKF / yj2.dll，约 10~60 秒
+# ① 生成地图数据 —— 需要 SSS.MKF / MAP.MKF / GOP.MKF，约 15 秒
+#    （yj2.dll 已经不需要了：YJ_2 解压内建为纯 Python，见 tools/yj2.py）
 python tools/build_data.py "D:\Game\PAL98"
 
 # ② 生成要素清单 —— 只需 SSS.MKF，离线读取，约 2 秒
@@ -388,7 +410,7 @@ python tools/env_check.py
 |---|---|
 | 操作系统 | Windows 10/11 |
 | 游戏 | **SDLPAL** 运行的《仙剑98柔情版》（窗口标题含 `Pal`） |
-| Python | 3.10+（64 位） |
+| Python | **3.9+**（建议 64 位；实测 3.9.19 / 3.11 / 3.13 都在跑，tkinter 随 Python 自带） |
 | 依赖 | `pip install -r requirements.txt` |
 
 > ⚠️ 内存地址（场景表 / 全局变量）按某一具体 SDLPAL 构建标定；换 exe 或
@@ -397,6 +419,14 @@ python tools/env_check.py
 > 「内存地址适配 & 换 exe / 换窗口」。
 
 ## 快速开始
+
+```cmd
+:: 最省事: 双击 start_bot.bat
+::   —— 缺依赖自己装、自己找游戏目录、缺数据自己生成、顺手开游戏和界面
+start_bot.bat
+```
+
+等价的手工三步：
 
 ```bash
 # 1. 安装依赖
@@ -497,9 +527,12 @@ python pal_bot_mem5.py 0 600 28 90 "" 穿门
 | `hotspot.json` | 分场景的怪窝/落脚点锚点 | 机器人 |
 | `feat_report.txt` / `.json` | 要素覆盖率报告（只读汇总，不是运行状态） | `tools/feat_report.py` |
 
-`yj2.dll` 是 YJ_2 图片/地图解压库，源码在开源项目
-[SDLPAL](https://github.com/sdlpal/sdlpal)（GPL）中，自行编译或从其发行包获取。
-生成过程只读游戏资源、只写本仓库目录，约 10~60 秒。
+**为什么不用外部的 `yj2.dll` 了**：地图块（`MAP.MKF`）原本要用 SDLPAL 的 YJ_2
+解压库，而那个 DLL 不在仓库里，新机器上得自己编译 —— 于是 v0.2.0-beta 把它
+移植成了纯 Python（`tools/yj2.py`，逐行对应 SDLPAL `yj2dll.c`）。验证方式：
+`MAP.MKF` 全部 223 张地图，DLL 输出与 Python 输出**逐字节相同**，重建出来的
+`map_walk.npy` 与当年用 DLL 生成的那份 **SHA256 相同**（见 `test_yj2.py`）。
+生成过程只读游戏资源、只写本仓库目录，约 15 秒。
 
 ## 运行参数说明
 
@@ -659,6 +692,7 @@ python pal_bot_mem5.py 0 600 28 90 "" 穿门
 ## 项目结构
 
 ```
+start_bot.bat         ★一键启动: 找 Python -> 装依赖 -> 找游戏 -> 生成数据 -> 开界面
 bot_gui.py            图形界面 (tkinter)
 botcfg.py             ★用户偏好持久化 (bot_config.json) + 按键名校验
 pal_bot_mem5.py       机器人主程序 (v17: 要素巡回 + 自动换场景, 入口)
@@ -671,6 +705,10 @@ pal_bot.py            窗口捕获/按键注入/战斗画面判定 + 运行时�
 wingeom.py            ★几何换算: 像素常量 ↔ 原生 320x200 坐标 (换窗口大小不失效)
 bot_watchdog.py       看门狗: bot 异常退出时自动冲洗游戏按键
 scene_check.py        场景体检: 场景号/可走域/连通分量/门禁后可达域
+tools/first_run.py        ★一键前置的真正实现 (start_bot.bat 调它): Python 版本 /
+                           依赖 / 游戏目录 (记住到 game_dir.txt) / 生成数据 / 开界面
+                           幂等、可反复跑; --no-launch 只做前置
+tools/yj2.py              ★YJ_2 解压纯 Python 移植 (MAP.MKF 地图块, 免外部 DLL)
 tools/env_check.py        环境体检: 窗口/几何/内存基址 一屏看完 (只读, 零副作用)
 tools/run_report.py       ★效率报告: 一场跑完, 时间去哪了/机制计数/卡点聚类 (只读)
 tools/door_audit.py       ★门审计: 当前场景每扇门在哪/可不可达/会选哪扇 (只读)
@@ -704,7 +742,12 @@ bot_featlog.py             ★要素台账 feat_log.json (按编号记每次战�
 bot_winlog.py              ★累计总胜场 win_total.json + 跨进程清空协议 win_reset.flag
 bot_explog.py              ★战斗收益台账 exp_log.json (每场经验/金钱 + 会话累计;
                            口径 v3: 每人所得 + 等级感知累计经验, 见「战斗收益面板」)
-tools/mkf.py               MKF 资源包读取器
+tools/mkf.py               MKF 资源包读取器 (含 YJ_1 解压的 Python 移植)
+test_yj2.py                ★YJ_2 解压回归 (37 项: 常数表与 SDLPAL 源码逐值一致 /
+                           树结构(根权重=321 符号数) / FGK 权值上浮 / 错误处理不死循环 /
+                           ★223 张地图与 map_walk.npy 全量对拍 / build_data 无任何 DLL)
+test_first_run.py          ★一键启动回归 (start_bot.bat 静态检查 + first_run.py
+                           各分支: 候选路径序/去重/记住游戏目录/--yes 不阻塞/轻量导入)
 test_mem5_logic.py         要素巡回 + 场景调度状态机 + 基址自检回归测试 (102 项)
 test_wingeom.py            几何换算回归测试 (100 项, 铁律: 标定窗口下逐位不变)
 test_speed_fix.py          朝向字段/转身补预算/迁移选门与退避/空转重试/日志隔离 回归 (54 项)
@@ -830,6 +873,11 @@ python tools/env_check.py
 ## 常见问题
 
 - **提示"缺少地图数据"** → 先跑 `tools/build_data.py`
+- **双击 `start_bot.bat` 报错 / 一闪而过** → 别双击、改成在命令行里跑
+  `start_bot.bat`（或 `python tools/first_run.py`），这样窗口不会立刻关，能看到
+  完整报错。最常见的两种：① 提示找不到 Python → 没装或安装时没勾
+  *Add python.exe to PATH*；② `[错误] 依赖没装上` → 没联网 / 需要管理员权限，
+  按屏幕提示换国内镜像重试。前置失败时 `.bat` 会自己 `pause`，不会一闪而过
 - **想在另一台电脑上跑（或两台机器共用这套代码）？** → 见
   [换一台电脑 / 在新机器上部署](#换一台电脑--在新机器上部署)。一句话：
   **代码 clone 过去 ≠ 能用** —— 还得 ① `pip install -r requirements.txt`；
@@ -930,5 +978,6 @@ python tools/env_check.py
 
 ## License
 
-MIT — 见 [LICENSE](LICENSE)。SDLPAL 为 GPL 项目，其编译产物 `yj2.dll`
-遵循其自身许可证分发，与本仓库代码独立。
+MIT — 见 [LICENSE](LICENSE)。地图解压用的 YJ_2 算法移植自 SDLPAL（GPL）的
+`yj2dll.c`，现已内建为纯 Python（`tools/yj2.py`）——**本仓库不再分发任何第三方
+编译产物**；本机测试时用于对拍的 `yj2.dll` 只存在于作者的游戏目录里，不入库。

@@ -1,0 +1,4 @@
+# 批处理文件必须用 CRLF 换行 —— cmd.exe 对纯 LF 的 .bat 有兼容问题,
+# 而 GitHub 的 Code -> Download ZIP 是按这里的属性导出文件的。
+# 属性写法: 仓库里存 LF (便于 diff), 检出/导出时转成 CRLF。
+*.bat text eol=crlf
