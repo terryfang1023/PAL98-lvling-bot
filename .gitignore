@@ -20,6 +20,9 @@ bot_config.json
 # 一键启动记住的游戏目录 (start_bot.bat / tools/first_run.py) —— 每台机器不同
 game_dir.txt
 
+# 一键启动记住的 Python 解释器 (start_bot.bat 写完下次直通) —— 每台机器不同
+python_exe.txt
+
 # 跑出来的台账 (已开过的箱子) —— 每台机器/每个存档不同, 不入库
 chest_log.json
 

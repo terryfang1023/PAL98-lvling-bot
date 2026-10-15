@@ -171,14 +171,17 @@ def step_deps():
                           "--disable-pip-version-check", "-r", REQ], cwd=REPO)
     refresh_import_paths()        # ★ pywin32 的 .pth 要手动重跑, 见函数注释
     miss = missing_deps()
-    if rc != 0 or miss:
+    if miss:
         say("%s 依赖没装上 (pip 返回 %d, 还缺 %s)", ERR, rc,
-            ", ".join(m for m, _ in miss) or "-")
+            ", ".join(m for m, _ in miss))
         say("      常见原因: 没联网 / Python 装在 Program Files 需要管理员权限 / pip 缺失")
         say("      国内可换镜像重试 (复制这一行到命令行):")
         say('        "%s" -m pip install -r "%s" -i https://pypi.tuna.tsinghua.edu.cn/simple',
             sys.executable, REQ)
         return False
+    if rc != 0:
+        # pip 非 0 但四个包都能导入 (常见: pywin32 的安装后脚本报错) -> 放行
+        say("%s pip 报了错 (返回 %d), 但 4 个依赖都能导入, 继续", WARN, rc)
     say("%s 依赖安装完成", OK)
     return True
 

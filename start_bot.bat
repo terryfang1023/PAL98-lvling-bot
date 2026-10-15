@@ -1,68 +1,112 @@
 @echo off
-chcp 65001 >nul
+chcp 936 >nul 2>nul
 setlocal
 cd /d "%~dp0"
-title ä»™å‰‘98 æŒ‚æœºæœºå™¨äºº
+title ÏÉ½£98 ¹Ò»ú»úÆ÷ÈË
 
-rem ============================================================================
-rem  åŒå‡»æˆ‘ = è£…ä¾èµ– -> æ‰¾æ¸¸æˆç›®å½• -> ç”Ÿæˆæ•°æ® -> æ‰“å¼€æœºå™¨äººç•Œé¢
+rem Ë«»÷ÎÒ = ×°ÒÀÀµ + ÕÒÓÎÏ·Ä¿Â¼ + Éú³ÉÊý¾Ý + ´ò¿ª»úÆ÷ÈË½çÃæ¡£
+rem ÕæÕýÂß¼­¶¼ÔÚ tools\first_run.py Àï, ÕâÀïÖ»¸ºÔðÕÒµ½ Python ²¢°ÑËüÀ­ÆðÀ´¡£
 rem
-rem  æ¸¸æˆç›®å½•æ”¾åœ¨æœ¬ç›®å½• (æˆ–ä¸Šä¸€çº§ / ä¸Šä¸¤çº§) æ—¶ä¸ç”¨å¡«è·¯å¾„;
-rem  æ”¾åˆ«å¤„çš„è¯ç¬¬ä¸€æ¬¡è¿è¡Œä¼šé—®ä¸€æ¬¡, ä¹‹åŽè®°åœ¨ game_dir.txt é‡Œ, å†åŒå‡»ç›´é€šç•Œé¢ã€‚
+rem ±¾ÎÄ¼þ±àÂë = GBK(ANSI), »»ÐÐ = CRLF¡£Á½¸ö¶¼±ð¸Ä, ÏêÇé¼û README¡£
 rem
-rem  å…¨éƒ¨å®žé™…é€»è¾‘éƒ½åœ¨ tools\first_run.py é‡Œ (ä¸­æ–‡æç¤ºä¹Ÿåœ¨é‚£è¾¹),
-rem  è¿™é‡Œåªè´Ÿè´£æ‰¾åˆ° Python å¹¶æŠŠå®ƒæ‹‰èµ·æ¥ â€”â€” æ‰€ä»¥åˆ»æ„ä¸ç”¨ goto/æ ‡ç­¾,
-rem  é¿å… cmd.exe è§£æž LF-only æ‰¹å¤„ç†æ—¶çš„å·²çŸ¥æ¯›ç—…ã€‚
-rem ============================================================================
+rem ÕÒ Python µÄÁ½ÌõÌúÂÉ (¸Ä¶¯Ç°Îñ±ØÏÈ¿´ README µÄ¡¸»»Ò»Ì¨µçÄÔ¡¹Ò»½Ú):
+rem   (1) ½âÊÍÆ÷Ò»ÂÉÓÃ¾ø¶ÔÂ·¾¶, ¾ø²»°ÑÂãÃüÁîÃû¼ÓÒýºÅÖ´ÐÐ¡£
+rem       ÒòÎª "py" -3 »áÈÃ py.exe µÄ²ÎÊý½âÎö´íÂÒ (±¨ Unable to create
+rem       process, errorlevel 101), ÓÚÊÇÃ÷Ã÷×°ÁË Python Ò²»á±¨¡¸ÕÒ²»µ½¡¹¡£
+rem   (2) Anaconda / Miniconda Ä¬ÈÏ²»½ø PATH, ËùÒÔÒª×Ô¼ºÉ¨°²×°Ä¿Â¼;
+rem       conda °æ×Ô´ø numpy, ÅÅÔÚ py Æô¶¯Æ÷Ç°ÃæÄÜÊ¡Ò»ÂÖÒÀÀµ°²×°¡£
+rem
+rem Ë³Ðò: ÍÏ½øÀ´µÄ > ÉÏ´Î¼Ç×¡µÄ > conda Ïµ > py Æô¶¯Æ÷ > ×°Ä¿Â¼ > PATH¡£
+rem
+rem ×¢Òâ %~dp0 ±ØÐëÔçµã´æ½ø HERE: ÏÂÃæÎªÁËÌÞ³ýÍÏ½øÀ´µÄ²ÎÊý»áÓÃ shift,
+rem ¶ø shift Á¬ %0 Ò»ÆðÒÆÎ», Ö®ºóÔÙÓÃ %~dp0 ¾ÍÖ¸µ½±ð´¦È¥ÁË¡£
 
+set "HERE=%~dp0"
 set "PYEXE="
 set "PYARGS="
 
-rem â‘  python.org çš„ py å¯åŠ¨å™¨ (æœ€å¯é )
-py -3 -c "import sys" >nul 2>nul && (set "PYEXE=py" & set "PYARGS=-3")
+rem (1) °Ñ python.exe ÍÏµ½±¾ÎÄ¼þÉÏÔÙËÉÊÖ: ¾ÍÓÃÄãÖ¸¶¨µÄÕâ¸ö
+rem     ×¢Òâ: ÍÏ½øÀ´µÄÂ·¾¶»áÕ¼×¡µÚ 1 ¸ö²ÎÊý, ±ØÐë shift µô, ·ñÔò»áÁ¬´ø
+rem     Í¸´«¸ø first_run.py -> ±¨ unrecognized arguments
+set "PYDROPPED="
+if /i "%~x1"==".exe" if exist "%~f1" set "PYDROPPED=1"
+if defined PYDROPPED set "PYEXE=%~f1"
 
-rem â‘¡ PATH é‡Œçš„ python (è·³è¿‡ Microsoft Store çš„å‡ python.exe)
-if not defined PYEXE (
-    for /f "delims=" %%p in ('where python 2^>nul') do (
-        if not defined PYEXE (
-            echo %%p | findstr /i "WindowsApps" >nul || set "PYEXE=%%p"
-        )
-    )
-)
-if defined PYEXE (
-    "%PYEXE%" %PYARGS% -c "import sys" >nul 2>nul || (set "PYEXE=" & set "PYARGS=")
-)
+rem (2) ÉÏ´ÎÕÒµ½µÄ½âÊÍÆ÷, ¼ÇÔÚ±¾ÎÄ¼þÅÔ±ßµÄ python_exe.txt Àï
+if not defined PYEXE if exist "%HERE%python_exe.txt" set /p PYEXE=<"%HERE%python_exe.txt"
+if defined PYEXE if not exist "%PYEXE%" set "PYEXE="
+
+rem (3) Anaconda / Miniconda
+if not defined PYEXE if exist "%USERPROFILE%\anaconda3\python.exe" set "PYEXE=%USERPROFILE%\anaconda3\python.exe"
+if not defined PYEXE if exist "%USERPROFILE%\Anaconda3\python.exe" set "PYEXE=%USERPROFILE%\Anaconda3\python.exe"
+if not defined PYEXE if exist "%USERPROFILE%\miniconda3\python.exe" set "PYEXE=%USERPROFILE%\miniconda3\python.exe"
+if not defined PYEXE if exist "%USERPROFILE%\Miniconda3\python.exe" set "PYEXE=%USERPROFILE%\Miniconda3\python.exe"
+if not defined PYEXE if exist "%ProgramData%\anaconda3\python.exe" set "PYEXE=%ProgramData%\anaconda3\python.exe"
+if not defined PYEXE if exist "%ProgramData%\Anaconda3\python.exe" set "PYEXE=%ProgramData%\Anaconda3\python.exe"
+if not defined PYEXE if exist "%ProgramData%\miniconda3\python.exe" set "PYEXE=%ProgramData%\miniconda3\python.exe"
+if not defined PYEXE if exist "%LOCALAPPDATA%\Continuum\anaconda3\python.exe" set "PYEXE=%LOCALAPPDATA%\Continuum\anaconda3\python.exe"
+if not defined PYEXE if exist "%LOCALAPPDATA%\Continuum\miniconda3\python.exe" set "PYEXE=%LOCALAPPDATA%\Continuum\miniconda3\python.exe"
+
+rem (4) python.org µÄ py Æô¶¯Æ÷: ¾ø¶ÔÂ·¾¶ + -3, ²»ÒÀÀµ PATH
+if not defined PYEXE if exist "%SystemRoot%\py.exe" set "PYEXE=%SystemRoot%\py.exe"
+if not defined PYARGS if /i "%PYEXE:~-6%"=="py.exe" set "PYARGS=-3"
+
+rem (5) python.org ×°µ½ÓÃ»§Ä¿Â¼µÄ°æ±¾
+if not defined PYEXE for /d %%d in ("%LOCALAPPDATA%\Programs\Python\Python3*") do if not defined PYEXE if exist "%%~fd\python.exe" set "PYEXE=%%~fd\python.exe"
+
+rem (6) python.org ×°µ½ C ÅÌ¸ùÏÂµÄ°æ±¾
+if not defined PYEXE for /d %%d in ("C:\Python3*") do if not defined PYEXE if exist "%%~fd\python.exe" set "PYEXE=%%~fd\python.exe"
+
+rem (7) PATH ÀïµÄ python (Ìø¹ýÎ¢ÈíÉÌµêµÄ¼Ù python: 0 ×Ö½ÚÕ¼Î»·û)
+if not defined PYEXE for /f "delims=" %%p in ('where python 2^>nul') do if not defined PYEXE if not "%%~zp"=="0" set "PYEXE=%%p"
+
+rem ÑéÖ¤: ÕæµÄÄÜÅÜÆðÀ´²ÅËãÊý (%PYEXE% Ò»¶¨ÊÇ¾ø¶ÔÂ·¾¶)
+if defined PYEXE "%PYEXE%" %PYARGS% -c "import sys" >nul 2>nul
+if defined PYEXE if errorlevel 1 set "PYEXE="
 
 if not defined PYEXE (
     echo.
-    echo   [é”™è¯¯] æ²¡æ‰¾åˆ°å¯ç”¨çš„ Python  â€”â€”  éœ€è¦ Python 3.9 ä»¥ä¸Š, å»ºè®® 64 ä½
+    echo   [´íÎó] Ã»ÕÒµ½¿ÉÓÃµÄ Python -- ÐèÒª Python 3.9 ÒÔÉÏ, ½¨Òé 64 Î»
     echo.
-    echo   1^) æ‰“å¼€  https://www.python.org/downloads/windows/
-    echo   2^) ä¸‹è½½å®‰è£… Python 3 çš„ Windows installer ^(64-bit^)
-    echo   3^) å®‰è£…ç¬¬ä¸€å±åŠ¡å¿…å‹¾é€‰  Add python.exe to PATH
-    echo   4^) è£…å®Œé‡æ–°åŒå‡»æœ¬æ–‡ä»¶
+    echo   ÒÑ¾­×°¹ý Python È´»¹ÊÇ±¨Õâ¸ö? Á½¸ö°ì·¨ÈÎÑ¡:
+    echo     a. ÕÒµ½ python.exe, °ÑËüÍÏµ½±¾ÎÄ¼þÉÏÔÙËÉÊÖ£¨µÈÓÚË«»÷Ò»´Î£©,
+    echo        ÕâÑù¾ÍÓÃÄãÖ¸¶¨µÄÄÇ·Ý, ²¢ÇÒ»á×Ô¶¯¼Ç×¡, ÏÂ´ÎÖ±Í¨¡£
+    echo     b. ÖØ×° Python Ê±¹´Ñ¡ Add python.exe to PATH¡£
     echo.
-    echo   å·²ç»è£…è¿‡ Python è¿˜æ˜¯æŠ¥è¿™ä¸ª? è¯´æ˜Žå®ƒæ²¡è¿› PATH:
-    echo     é‡è£…å¹¶å‹¾é€‰ Add to PATH, æˆ–ç›´æŽ¥ç”¨ py å¯åŠ¨å™¨ ^(python.org ç‰ˆè‡ªå¸¦^)ã€‚
+    echo   ÏÂÔØ: https://www.python.org/downloads/windows/
+    echo.
+    echo   ----------------------- Õï¶ÏÐÅÏ¢£¨½ØÍ¼¸ø×÷Õß£©-----------------------
+    set PATH
+    echo.
+    where python
+    echo.
+    if exist "%SystemRoot%\py.exe" "%SystemRoot%\py.exe" -0
+    echo   ----------------------------------------------------------------------
     echo.
     pause
     exit /b 1
 )
 
-if not exist "%~dp0tools\first_run.py" (
+if not exist "%HERE%tools\first_run.py" (
     echo.
-    echo   [é”™è¯¯] æ‰¾ä¸åˆ° tools\first_run.py
-    echo   è¯·æŠŠæ•´ä¸ª pal98-bot æ–‡ä»¶å¤¹ä¸€èµ·è§£åŽ‹/å¤åˆ¶, ä¸è¦åªæ‹¿è¿™ä¸€ä¸ª bat æ–‡ä»¶ã€‚
+    echo   [´íÎó] ÕÒ²»µ½ tools\first_run.py
+    echo   Çë°ÑÕû¸ö pal98-bot ÎÄ¼þ¼ÐÒ»Æð½âÑ¹/¸´ÖÆ, ²»ÒªÖ»ÄÃÕâÒ»¸ö bat ÎÄ¼þ¡£
     echo.
     pause
     exit /b 1
 )
 
-"%PYEXE%" %PYARGS% "%~dp0tools\first_run.py" %*
+rem ¼Ç×¡Õâ·Ý½âÊÍÆ÷, ÏÂ´ÎË«»÷Ö±Í¨ (Ö»¼Ç¾ø¶ÔÂ·¾¶)
+> "%HERE%python_exe.txt" echo %PYEXE%
+
+rem ÍÏ½øÀ´¹ý½âÊÍÆ÷ -> ÓÃµôµÚ 1 ¸ö²ÎÊý (shift Ö®ºó %1 ¾ÍÊÇÔ­À´µÄ %2)
+if defined PYDROPPED shift
+
+"%PYEXE%" %PYARGS% "%HERE%tools\first_run.py" %1 %2 %3 %4 %5 %6 %7 %8 %9
 if errorlevel 1 (
     echo.
-    echo   å‰ç½®æ­¥éª¤æ²¡æœ‰æˆåŠŸ â€”â€” è¯·æŠŠä¸Šé¢çš„æŠ¥é”™æˆªå›¾å‘ç»™ä½œè€…,
-    echo   æˆ–çœ‹ README.md çš„ã€Œå¸¸è§é—®é¢˜ã€ä¸€èŠ‚ã€‚
+    echo   Ç°ÖÃ²½ÖèÃ»ÓÐ³É¹¦ -- Çë°ÑÉÏÃæµÄ±¨´í½ØÍ¼·¢¸ø×÷Õß,
+    echo   »ò¿´ README.md µÄ¡¸³£¼ûÎÊÌâ¡¹Ò»½Ú¡£
     echo.
     pause
     exit /b 1

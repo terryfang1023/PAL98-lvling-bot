@@ -1,0 +1,115 @@
+@echo off
+chcp 936 >nul 2>nul
+setlocal
+cd /d "%~dp0"
+title 仙剑98 挂机机器人
+
+rem 双击我 = 装依赖 + 找游戏目录 + 生成数据 + 打开机器人界面。
+rem 真正逻辑都在 tools\first_run.py 里, 这里只负责找到 Python 并把它拉起来。
+rem
+rem 本文件编码 = GBK(ANSI), 换行 = CRLF。两个都别改, 详情见 README。
+rem
+rem 找 Python 的两条铁律 (改动前务必先看 README 的「换一台电脑」一节):
+rem   (1) 解释器一律用绝对路径, 绝不把裸命令名加引号执行。
+rem       因为 "py" -3 会让 py.exe 的参数解析错乱 (报 Unable to create
+rem       process, errorlevel 101), 于是明明装了 Python 也会报「找不到」。
+rem   (2) Anaconda / Miniconda 默认不进 PATH, 所以要自己扫安装目录;
+rem       conda 版自带 numpy, 排在 py 启动器前面能省一轮依赖安装。
+rem
+rem 顺序: 拖进来的 > 上次记住的 > conda 系 > py 启动器 > 装目录 > PATH。
+rem
+rem 注意 %~dp0 必须早点存进 HERE: 下面为了剔除拖进来的参数会用 shift,
+rem 而 shift 连 %0 一起移位, 之后再用 %~dp0 就指到别处去了。
+
+set "HERE=%~dp0"
+set "PYEXE="
+set "PYARGS="
+
+rem (1) 把 python.exe 拖到本文件上再松手: 就用你指定的这个
+rem     注意: 拖进来的路径会占住第 1 个参数, 必须 shift 掉, 否则会连带
+rem     透传给 first_run.py -> 报 unrecognized arguments
+set "PYDROPPED="
+if /i "%~x1"==".exe" if exist "%~f1" set "PYDROPPED=1"
+if defined PYDROPPED set "PYEXE=%~f1"
+
+rem (2) 上次找到的解释器, 记在本文件旁边的 python_exe.txt 里
+if not defined PYEXE if exist "%HERE%python_exe.txt" set /p PYEXE=<"%HERE%python_exe.txt"
+if defined PYEXE if not exist "%PYEXE%" set "PYEXE="
+
+rem (3) Anaconda / Miniconda
+if not defined PYEXE if exist "%USERPROFILE%\anaconda3\python.exe" set "PYEXE=%USERPROFILE%\anaconda3\python.exe"
+if not defined PYEXE if exist "%USERPROFILE%\Anaconda3\python.exe" set "PYEXE=%USERPROFILE%\Anaconda3\python.exe"
+if not defined PYEXE if exist "%USERPROFILE%\miniconda3\python.exe" set "PYEXE=%USERPROFILE%\miniconda3\python.exe"
+if not defined PYEXE if exist "%USERPROFILE%\Miniconda3\python.exe" set "PYEXE=%USERPROFILE%\Miniconda3\python.exe"
+if not defined PYEXE if exist "%ProgramData%\anaconda3\python.exe" set "PYEXE=%ProgramData%\anaconda3\python.exe"
+if not defined PYEXE if exist "%ProgramData%\Anaconda3\python.exe" set "PYEXE=%ProgramData%\Anaconda3\python.exe"
+if not defined PYEXE if exist "%ProgramData%\miniconda3\python.exe" set "PYEXE=%ProgramData%\miniconda3\python.exe"
+if not defined PYEXE if exist "%LOCALAPPDATA%\Continuum\anaconda3\python.exe" set "PYEXE=%LOCALAPPDATA%\Continuum\anaconda3\python.exe"
+if not defined PYEXE if exist "%LOCALAPPDATA%\Continuum\miniconda3\python.exe" set "PYEXE=%LOCALAPPDATA%\Continuum\miniconda3\python.exe"
+
+rem (4) python.org 的 py 启动器: 绝对路径 + -3, 不依赖 PATH
+if not defined PYEXE if exist "%SystemRoot%\py.exe" set "PYEXE=%SystemRoot%\py.exe"
+if not defined PYARGS if /i "%PYEXE:~-6%"=="py.exe" set "PYARGS=-3"
+
+rem (5) python.org 装到用户目录的版本
+if not defined PYEXE for /d %%d in ("%LOCALAPPDATA%\Programs\Python\Python3*") do if not defined PYEXE if exist "%%~fd\python.exe" set "PYEXE=%%~fd\python.exe"
+
+rem (6) python.org 装到 C 盘根下的版本
+if not defined PYEXE for /d %%d in ("C:\Python3*") do if not defined PYEXE if exist "%%~fd\python.exe" set "PYEXE=%%~fd\python.exe"
+
+rem (7) PATH 里的 python (跳过微软商店的假 python: 0 字节占位符)
+if not defined PYEXE for /f "delims=" %%p in ('where python 2^>nul') do if not defined PYEXE if not "%%~zp"=="0" set "PYEXE=%%p"
+
+rem 验证: 真的能跑起来才算数 (%PYEXE% 一定是绝对路径)
+if defined PYEXE "%PYEXE%" %PYARGS% -c "import sys" >nul 2>nul
+if defined PYEXE if errorlevel 1 set "PYEXE="
+
+if not defined PYEXE (
+    echo.
+    echo   [错误] 没找到可用的 Python -- 需要 Python 3.9 以上, 建议 64 位
+    echo.
+    echo   已经装过 Python 却还是报这个? 两个办法任选:
+    echo     a. 找到 python.exe, 把它拖到本文件上再松手（等于双击一次）,
+    echo        这样就用你指定的那份, 并且会自动记住, 下次直通。
+    echo     b. 重装 Python 时勾选 Add python.exe to PATH。
+    echo.
+    echo   下载: https://www.python.org/downloads/windows/
+    echo.
+    echo   ----------------------- 诊断信息（截图给作者）-----------------------
+    set PATH
+    echo.
+    where python
+    echo.
+    if exist "%SystemRoot%\py.exe" "%SystemRoot%\py.exe" -0
+    echo   ----------------------------------------------------------------------
+    echo.
+    pause
+    exit /b 1
+)
+
+if not exist "%HERE%tools\first_run.py" (
+    echo.
+    echo   [错误] 找不到 tools\first_run.py
+    echo   请把整个 pal98-bot 文件夹一起解压/复制, 不要只拿这一个 bat 文件。
+    echo.
+    pause
+    exit /b 1
+)
+
+rem 记住这份解释器, 下次双击直通 (只记绝对路径)
+> "%HERE%python_exe.txt" echo %PYEXE%
+
+rem 拖进来过解释器 -> 用掉第 1 个参数 (shift 之后 %1 就是原来的 %2)
+if defined PYDROPPED shift
+
+"%PYEXE%" %PYARGS% "%HERE%tools\first_run.py" %1 %2 %3 %4 %5 %6 %7 %8 %9
+if errorlevel 1 (
+    echo.
+    echo   前置步骤没有成功 -- 请把上面的报错截图发给作者,
+    echo   或看 README.md 的「常见问题」一节。
+    echo.
+    pause
+    exit /b 1
+)
+
+exit /b 0

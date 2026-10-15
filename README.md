@@ -291,7 +291,7 @@ D:\Game\PAL98\                    ← 游戏目录
 改名成 `pal98-bot` 随意）。也可以 `git clone` —— 区别只有一个：clone 的以后能
 `git pull` 拉更新，ZIP 是一次性快照，要更新得重新下。
 
-ZIP / clone 里**只有 84 个文件**（`.py` / `.md` / `.bat` / 配图 / `LICENSE` / `requirements.txt`），
+ZIP / clone 里**只有 86 个文件**（`.py` / `.md` / `.bat` / 配图 / `LICENSE` / `requirements.txt`），
 **不含**游戏资源，**也不含** `map_walk.npy` / `scene_info.json` 等生成物 ——
 所以新机器上还要做三件事 —— **但不用手敲，双击 `start_bot.bat` 就行**：
 
@@ -321,6 +321,25 @@ python bot_gui.py
 > 约 2 秒直达界面。它只做上面这些事 —— 不碰你的台账、不会自动开始挂机
 > （开始/停止仍然在界面里点）。想只做前置不开界面：`start_bot.bat --no-launch`；
 > 想后台启动（窗口可直接关掉）：`start_bot.bat --detach`。
+
+> 🔧 **万一把 Python 装好了，`start_bot.bat` 还说「没找到可用的 Python」**：
+> 它按**绝对路径**依次试这几处 —— 上次记住的（`python_exe.txt`）→ Anaconda /
+> Miniconda（`%USERPROFILE%\anaconda3`、`%ProgramData%\Anaconda3` 等，**conda 默认
+> 不进 PATH**）→ python.org 的 `py` 启动器 → `%LOCALAPPDATA%\Programs\Python\Python3*`
+> 与 `C:\Python3*` → PATH 里的 `python`（自动跳过微软商店那个 0 字节占位符）。
+> 全都试过还不行，就直接**把 `python.exe` 拖到 `start_bot.bat` 上再松手** —— 等于
+> 双击一次，会用你指定的那份，并记进 `python_exe.txt`，以后每次直通。报错时它还会
+> 打印 PATH / `where python` / `py -0` 的结果，截图发给作者能立刻定位。
+>
+> 探测顺序里 conda 系排在 `py` 启动器**前面**：conda 版自带 numpy，这样能省掉一轮
+> 依赖安装（如果你机器上同时装了 Anaconda 和 python.org 版，它会选 Anaconda）。
+
+> ⚠️ **要改 `start_bot.bat` 的话（开发者注意）**：仓库里那份是 **GBK(ANSI) 编码** ——
+> 它必须跟中文 Windows 的 cmd 代码页一致。如果存成 UTF-8 再 `chcp 65001`，中文会被
+> 「间接误解码」导致行边界错位，`rem` 注释的片段会被当成命令执行，表现为
+> 「此时不应有 xxx」或「明明装了 Python 却说找不到」。所以**别直接改它**：
+> 改 `start_bot.bat.utf8`（UTF-8 源），再跑 `python tools/build_bat.py` 生成。
+> `test_first_run.py` 会断言「产物 == 源构建的结果」，手改产物会 FAIL。
 
 > 💡 **最省事的搬法：把生成物直接拷过去。** 生成物只取决于游戏资源，两台机器的
 > 游戏资源是**同一版本**时，拷过去就能用，**不用重跑 `build_data.py`**（省掉 10~60 秒，
@@ -693,6 +712,9 @@ python pal_bot_mem5.py 0 600 28 90 "" 穿门
 
 ```
 start_bot.bat         ★一键启动: 找 Python -> 装依赖 -> 找游戏 -> 生成数据 -> 开界面
+                        仓库里这份是 GBK 编码(必须跟 cmd 的 936 代码页一致);
+                        ★不要手改它 —— 改下面的 .utf8 源, 再跑 tools/build_bat.py
+start_bot.bat.utf8    ★上面那个 .bat 的 UTF-8 源 (唯一编辑入口)
 bot_gui.py            图形界面 (tkinter)
 botcfg.py             ★用户偏好持久化 (bot_config.json) + 按键名校验
 pal_bot_mem5.py       机器人主程序 (v17: 要素巡回 + 自动换场景, 入口)
@@ -708,6 +730,8 @@ scene_check.py        场景体检: 场景号/可走域/连通分量/门禁后�
 tools/first_run.py        ★一键前置的真正实现 (start_bot.bat 调它): Python 版本 /
                            依赖 / 游戏目录 (记住到 game_dir.txt) / 生成数据 / 开界面
                            幂等、可反复跑; --no-launch 只做前置
+tools/build_bat.py        ★把 start_bot.bat.utf8 构建成 GBK 编码的 start_bot.bat
+                           (为什么必须转码见上面「开发者注意」一段)
 tools/yj2.py              ★YJ_2 解压纯 Python 移植 (MAP.MKF 地图块, 免外部 DLL)
 tools/env_check.py        环境体检: 窗口/几何/内存基址 一屏看完 (只读, 零副作用)
 tools/run_report.py       ★效率报告: 一场跑完, 时间去哪了/机制计数/卡点聚类 (只读)
@@ -746,8 +770,9 @@ tools/mkf.py               MKF 资源包读取器 (含 YJ_1 解压的 Python 移
 test_yj2.py                ★YJ_2 解压回归 (37 项: 常数表与 SDLPAL 源码逐值一致 /
                            树结构(根权重=321 符号数) / FGK 权值上浮 / 错误处理不死循环 /
                            ★223 张地图与 map_walk.npy 全量对拍 / build_data 无任何 DLL)
-test_first_run.py          ★一键启动回归 (start_bot.bat 静态检查 + first_run.py
-                           各分支: 候选路径序/去重/记住游戏目录/--yes 不阻塞/轻量导入)
+test_first_run.py          ★一键启动回归 (90 项: .bat 编码/绝对路径解释器/块内裸括号
+                           /shift 剔除拖拽参数/源与产物一致 + first_run.py 各分支:
+                           候选路径序/去重/记住游戏目录/--yes 不阻塞/轻量导入)
 test_mem5_logic.py         要素巡回 + 场景调度状态机 + 基址自检回归测试 (102 项)
 test_wingeom.py            几何换算回归测试 (100 项, 铁律: 标定窗口下逐位不变)
 test_speed_fix.py          朝向字段/转身补预算/迁移选门与退避/空转重试/日志隔离 回归 (54 项)
@@ -875,7 +900,8 @@ python tools/env_check.py
 - **提示"缺少地图数据"** → 先跑 `tools/build_data.py`
 - **双击 `start_bot.bat` 报错 / 一闪而过** → 别双击、改成在命令行里跑
   `start_bot.bat`（或 `python tools/first_run.py`），这样窗口不会立刻关，能看到
-  完整报错。最常见的两种：① 提示找不到 Python → 没装或安装时没勾
+  完整报错。最常见的两种：① 提示找不到 Python → **先试「把 `python.exe` 拖到
+  `start_bot.bat` 上再松手」**（会自动记住）；还不行就是没装、或装时没勾
   *Add python.exe to PATH*；② `[错误] 依赖没装上` → 没联网 / 需要管理员权限，
   按屏幕提示换国内镜像重试。前置失败时 `.bat` 会自己 `pause`，不会一闪而过
 - **想在另一台电脑上跑（或两台机器共用这套代码）？** → 见
