@@ -124,6 +124,39 @@ def missing_deps():
     return out
 
 
+def refresh_import_paths():
+    """让"刚 pip 装上的包"马上能被本进程看见。
+
+    ★ 为什么必须有这个 (2026-10-15 真机踩到): **pywin32 是靠 `.pth` 文件**把
+    `site-packages\\win32` 加进 `sys.path` 的, 而 `.pth` 只在**解释器启动时**
+    处理一次 —— 于是同一个进程里 `pip install pywin32` 之后, `win32gui` 依然
+    导不到: 实测 pip 返回 0, 我们却报"还缺 win32gui/win32process", 新机器上
+    第一次双击就变成"前置失败"(第二次才对)。这里手动把 site 目录的 `.pth`
+    重跑一遍 + 清 import 缓存, 让本进程也能立刻用。
+    """
+    try:
+        import importlib
+        import site
+        dirs = []
+        for getter in ("getsitepackages", "getusersitepackages"):
+            try:
+                v = getattr(site, getter)()
+                dirs.extend(v if isinstance(v, (list, tuple)) else [v])
+            except Exception:
+                pass
+        for p in dirs:
+            if p and os.path.isdir(p):
+                try:
+                    site.addsitedir(p)       # 会重新执行目录下的 .pth
+                except Exception:
+                    pass
+        importlib.invalidate_caches()
+        for m in ("win32", "win32gui", "win32process", "pythoncom", "pywintypes"):
+            sys.modules.pop(m, None)
+    except Exception:
+        pass
+
+
 def step_deps():
     miss = missing_deps()
     if not miss:
@@ -136,6 +169,7 @@ def step_deps():
         return False
     rc = subprocess.call([sys.executable, "-m", "pip", "install",
                           "--disable-pip-version-check", "-r", REQ], cwd=REPO)
+    refresh_import_paths()        # ★ pywin32 的 .pth 要手动重跑, 见函数注释
     miss = missing_deps()
     if rc != 0 or miss:
         say("%s 依赖没装上 (pip 返回 %d, 还缺 %s)", ERR, rc,

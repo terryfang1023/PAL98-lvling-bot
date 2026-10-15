@@ -206,6 +206,13 @@ check("缺依赖能被检出 (含不存在的模块)",
 FR.DEPS = _old_deps
 check("本机依赖齐全 (numpy/Pillow/psutil/pywin32)", FR.missing_deps() == [],
       FR.missing_deps())
+check("★ 装完依赖会重跑 .pth (pywin32 的 win32gui 同进程才可见)",
+      src_fr.rindex("refresh_import_paths()")
+      > src_fr.index('"pip", "install"'))
+check("refresh_import_paths 可调用且幂等",
+      FR.refresh_import_paths() is None and FR.refresh_import_paths() is None)
+check("重跑 .pth 后依赖判定不变 (本机已齐 -> 仍为 [])",
+      FR.missing_deps() == [])
 
 check("run_tool 成功 -> True",
       FR.run_tool("自检成功", ["-c", "pass"], "0 秒") is True)
