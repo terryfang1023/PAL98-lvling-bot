@@ -232,7 +232,7 @@ def main():
         check("PAL_HEAL_AFTER_BATTLE 已传 (开)",
               env1.get("PAL_HEAL_AFTER_BATTLE") == "1",
               str(env1.get("PAL_HEAL_AFTER_BATTLE")))
-        check("PAL_HEAL_SEQ 已传且等于默认 8 键序列",
+        check("PAL_HEAL_SEQ 已传且等于默认序列",
               G.botcfg.parse_seq(env1.get("PAL_HEAL_SEQ", "")) ==
               G.botcfg.parse_seq(G.botcfg.SEQ_DEFAULT),
               str(env1.get("PAL_HEAL_SEQ")))

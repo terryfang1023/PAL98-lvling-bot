@@ -108,7 +108,14 @@ def macro(g, menu_feat=True, battle=False, escape=None, gap=GAP):
                      escape=escape, gap=gap)
 
 
-SEQ = ["esc", "enter", "right", "enter", "enter", "right", "enter", "esc"]
+# 当前默认序列 = **存档路径** (2026-10-15 用户真机复核)。
+# ★ 这里刻意跟着 botcfg.SEQ_DEFAULT 走: 第 8/9 节会断言两者一致 ——
+#   默认值一旦被改回旧的"补血"路径, 测试立刻红。
+SEQ = ["esc", "enter", "enter", "enter"]
+
+# 一条**更长的**序列: 只喂给"按到一半被打断"这类跟长度有关的用例
+#   (中间键多, 才走得到"发了两键之后中止"的分支)。键名本身无意义。
+SEQ_LONG = ["esc", "enter", "right", "enter", "enter", "right", "enter", "esc"]
 
 
 # ======================================================================
@@ -176,9 +183,13 @@ check("关不掉 -> 兜底被调过", esc.n == 1)
 print("=" * 66)
 print("第 5 节: 收尾没回到地图 -> 补 esc; 补完就好了")
 print("=" * 66)
-# 帧预算 (v19.1 起): a0 / a1 之后, 6 个中间键各先拍 1 帧查战斗 (吃 6 帧
-# F_STUCK), 收尾轮询 POLL_TIMES=2 再吃 2 帧 F_STUCK, 补 esc 后轮询吃 F_MAP
-g = FakeG([F_MAP, F_MENU] + [F_STUCK] * 6 + [F_STUCK, F_STUCK, F_MAP])
+# 帧预算 (v19.1 起, 2026-10-15 改成按序列长度算 —— 免得改序列时又要手数一遍):
+#   a0 / a1 之后, 每个中间键各先拍 1 帧查战斗 (n_mid 帧 F_STUCK),
+#   收尾轮询再吃 POLL_TIMES 帧 F_STUCK, 然后补 1 次 esc,
+#   补完的第 2 帧给 F_MAP -> "补一次就好了"。
+n_mid = len(SEQ) - 2
+g = FakeG([F_MAP, F_MENU] + [F_STUCK] * (n_mid + H.POLL_TIMES)
+          + [F_STUCK, F_MAP])
 r = macro(g).run(SEQ)
 check("补了 1 次 esc 后成功", r["ok"] is True and r["esc_extra"] == 1,
       "esc_extra=%d %s" % (r["esc_extra"], r["reason"]))
@@ -257,7 +268,9 @@ wipe_env()
 host = Host([F_MAP, F_MENU, F_MAP])
 c = host.heal_load(CFG)
 check("默认: 开启", c["on"] is True and c["err"] == "")
-check("默认序列 = 用户给的 8 键", c["keys"] == SEQ, " ".join(c["keys"]))
+check("默认序列 = 存档路径 4 键", c["keys"] == SEQ, " ".join(c["keys"]))
+check("★ 默认序列钉死为存档路径 (不是旧的补血 8 键)",
+      botcfg.SEQ_DEFAULT == "esc,enter,enter,enter", botcfg.SEQ_DEFAULT)
 check("默认每 1 场 / 间隔 0.3s", c["every"] == 1 and abs(c["gap"] - 0.3) < 1e-9)
 check("heal_summary 能读", "开启" in host.heal_summary(), host.heal_summary())
 
@@ -368,7 +381,7 @@ print("第 9 节: 序列解析 (中文键名 / 分隔符 / 非法项)")
 print("=" * 66)
 check("默认序列可解析", botcfg.parse_seq(botcfg.SEQ_DEFAULT) == SEQ)
 check("中文与英文混写等价",
-      botcfg.parse_seq("ESC → 回车 → 右 → 回车 → 回车 → 右 → 回车 → ESC") == SEQ)
+      botcfg.parse_seq("ESC → 回车 → 回车 → 回车") == SEQ)
 check("空格分隔也认", botcfg.parse_seq("esc 回车 右 esc") ==
       ["esc", "enter", "right", "esc"])
 check("上/下/左/空格 都有中文写法",
@@ -414,10 +427,11 @@ check("原因提到战斗中止", "战斗" in r["reason"] and "中止" in r["rea
       r["reason"])
 
 # ② 战斗在第 3 个键之前才开始 -> 前两个中间键照发, 之后立刻停
+#    (用长序列 SEQ_LONG: 4 键的默认序列只有 2 个中间键, 走不到这个分支)
 keys = []
 m = macro_battle_script([False, False, False, True],
                         [F_MAP, F_MENU, F_MAP, F_MAP, F_MAP, F_STUCK])
-r = m.run(SEQ)
+r = m.run(SEQ_LONG)
 check("前两键照发后中止", r["sent"] == ["esc", "enter", "right"],
       str(r["sent"]))
 check("中止后 enter 不再发",
