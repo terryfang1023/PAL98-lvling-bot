@@ -288,7 +288,7 @@ D:\Game\PAL98\                    ← 游戏目录
 改名成 `pal98-bot` 随意）。也可以 `git clone` —— 区别只有一个：clone 的以后能
 `git pull` 拉更新，ZIP 是一次性快照，要更新得重新下。
 
-ZIP / clone 里**只有 73 个文件**（`.py` / `.md` / 配图 / `LICENSE` / `requirements.txt`），
+ZIP / clone 里**只有 78 个文件**（`.py` / `.md` / 配图 / `LICENSE` / `requirements.txt`），
 **不含**游戏资源，**也不含** `map_walk.npy` / `scene_info.json` 等生成物 ——
 所以新机器上还要做三件事：
 
@@ -304,9 +304,22 @@ python tools/build_scene_info.py --game "D:\你的游戏目录"   # 约 2 秒
 python bot_gui.py
 ```
 
-> 💡 生成物（`map_walk.npy` / `scene_info.json` / `scene_score.json`）**只取决于游戏资源**，
-> 所以两份**同一版本**的游戏资源之间，直接把生成物拷过去也能用，省掉重新生成。
-> 但 `*.npy` 有 15MB，别拷进仓库（`.gitignore` 已经挡住，不会被提交）。
+> 💡 **最省事的搬法：把生成物直接拷过去。** 生成物只取决于游戏资源，两台机器的
+> 游戏资源是**同一版本**时，拷过去就能用，**不用重跑 `build_data.py`**（省掉 10~60 秒，
+> 也不需要 `yj2.dll`）。要拷的是这些（都放在仓库根目录）：
+>
+> | 拷什么 | 文件 | 不拷会怎样 |
+> |---|---|---|
+> | 地图 / 寻路 | `map_walk.npy` `map_walk2.npy` `gyt_scene_report.txt` | **启动即 `FileNotFoundError`**，必须先做第 ① 步 |
+> | 要素清单 | `scene_info.json` | 退回 v15 巡逻模式（不直奔怪点） |
+> | 场景评分 | `scene_score.json` | 可选，所有场景用默认耐心 |
+> | 运行进度 | `hotspot.json` `mem_doors.json` `scene_links.json` | 可选，想接着上次的怪窝/门路图才拷 |
+> | 台账 | `chest_log.json` `feat_log.json` `win_total.json` `exp_log.json` | 可选，想保留「累计胜场 / 已开箱 / 收益」记录才拷 |
+> | 界面偏好 | `bot_config.json` | 可选，攻击键等 GUI 设置（不拷就是默认值） |
+>
+> 反过来说：**`git pull` 更新代码不会碰这些文件** —— 它们全在 `.gitignore` 里，
+> 拉新版本既不会覆盖你的进度台账，也不会删掉 15MB 的 `map_walk.npy`。
+> 但 `*.npy` 有 15MB，别拷进仓库提交（`.gitignore` 已经挡住）。
 
 #### 游戏路径怎么指定：其实大多数时候不用指定
 
@@ -817,6 +830,12 @@ python tools/env_check.py
 ## 常见问题
 
 - **提示"缺少地图数据"** → 先跑 `tools/build_data.py`
+- **想在另一台电脑上跑（或两台机器共用这套代码）？** → 见
+  [换一台电脑 / 在新机器上部署](#换一台电脑--在新机器上部署)。一句话：
+  **代码 clone 过去 ≠ 能用** —— 还得 ① `pip install -r requirements.txt`；
+  ② 装上你自己的游戏（SDLPAL + 游戏资源，仓库里没有）；③ 生成物
+  （`map_walk.npy` / `scene_info.json`）要么重跑生成脚本、要么从旧机器拷过去；
+  ④ 首次启动前跑一次环境体检。生成物与台账都在 `.gitignore` 里，**`git pull` 不会动它们**
 - **换了 exe / 重启后缩放了窗口，还能跑吗？** → 跑一次 **环境体检**
   （界面按钮，或 `python tools/env_check.py`，只读 5 秒）。**缩放窗口没问题**
   （画面常量已按实测几何运行时换算，标定窗口下逐位不变）；**换 exe 看基址**——
