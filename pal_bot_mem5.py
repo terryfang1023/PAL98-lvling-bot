@@ -73,6 +73,7 @@ import pal_bot as PB                                          # noqa: E402
 import bot_chestlog as chestlog                                # noqa: E402
 import bot_featlog as featlog                                  # noqa: E402
 import bot_winlog as winlog                                    # noqa: E402
+import bot_explog as gainlog                                   # noqa: E402
 from pal_bot_mem import MemBot                                # noqa: E402
 from pal_bot_mem4 import MemBot4                              # noqa: E402
 from scene_pilot import ScenePilot                            # noqa: E402
@@ -231,7 +232,11 @@ def chest_face_key(da, db):
 
 def _game_pids():
     """标题含 'Pal' 的窗口所属进程 pid。
-    注意: ctypes.wintypes 只有**类型**, 库要从 ctypes.windll 取。"""
+    注意: ctypes.wintypes 只有**类型**, 库要从 ctypes.windll 取。
+
+    ★ 2026-10-12: 排除自家 GUI ("挂机机器人") —— 以前只靠大小写侥幸不撞车,
+      详见 pal_bot_mem.find_pal_pid 的说明。
+    """
     u32 = ctypes.windll.user32
     res = []
 
@@ -243,7 +248,7 @@ def _game_pids():
         if n:
             b = ctypes.create_unicode_buffer(n + 1)
             u32.GetWindowTextW(hwnd, b, n + 1)
-            if "Pal" in b.value:
+            if "Pal" in b.value and "挂机机器人" not in b.value:
                 res.append(pid.value)
         return True
     u32.EnumWindows(cb, 0)
@@ -591,6 +596,21 @@ class MemBot5(MemBot4):
         # ---- 总胜场 (win_total.json): 跨重启累计, 可用 win_reset.flag 清空 ----
         self.win_log = winlog.WinLog()
         self._win_total = self.win_log.total()
+        # ---- ★ v19.3/v3 战斗收益 (exp_log.json): 每场经验/金钱 + 会话累计 ----
+        #   快照口径见 bot_explog 模块头。机器人是唯一写者, GUI 只读。
+        #   ★ 会话累计改为**逐场累加** (旧写法"当前-基线"遇升级/满级循环/读档
+        #     会整段作废, 把累计反复清零 -> 时均明显偏小)。
+        self.gain_log = gainlog.GainLog()
+        self._gain_t0 = time.time()     # 会话起点 (每小时平均的分母)
+        self._gain_exp_tot = 0          # 会话累计经验 (逐场累加, 单人口径)
+        self._gain_cash_tot = 0         # 会话累计金钱 (逐场累加)
+        self._gain_bad = 0              # 会话内跳过的脏数据场次
+        self._gain_pre = None           # 上一场战前快照
+        try:
+            self._levelup_tab = self.mem.levelup_table() \
+                if hasattr(self.mem, "levelup_table") else None
+        except Exception:
+            self._levelup_tab = None    # 游戏还没起来/读不到 -> 记账时惰性重读
         self.log("[配置] 要素台账 = %s | 累计总胜场 = %d 场%s"
                  % ("开 (按编号记每次战斗)" if self.FEAT_LOG else "关",
                     self._win_total,
@@ -2107,6 +2127,11 @@ class MemBot5(MemBot4):
     #  战斗挂钩: 记战果 + 让怪点进入冷却
     # ------------------------------------------------------------------
     def fight(self, why=""):
+        # ★ v19.3: 战前快照 (经验总和/金钱) —— 放在**进战斗之前**拍, 开箱/
+        #   剧情的收益就不会混进"单场收益" (会话累计仍包含它们)。读失败就
+        #   None, 战后 _gain_record 会跳过本场 (宁可漏一场不记假数)。
+        self._gain_pre = self.mem.read_gain() \
+            if hasattr(self.mem, "read_gain") else None
         st = self.mem.state()
         sc, K = st["scene"], st["K"]
         won0 = getattr(self, "battles_won", 0)
@@ -2137,6 +2162,11 @@ class MemBot5(MemBot4):
                 self._note_win(sc, K, near)
         except Exception as e:            # 台账坏了绝不影响挂机
             self.log("[胜场] 记账异常(%s) -> 只跳过记账" % e)
+        # ★ v19.3: 战斗收益记账 (每场经验/金钱)。同样绝不影响挂机。
+        try:
+            self._gain_record()
+        except Exception as e:
+            self.log("[收益] 记账异常(%s) -> 跳过" % e)
         return ok
 
     def _note_win(self, sc, K, near):
@@ -2169,6 +2199,52 @@ class MemBot5(MemBot4):
                     ("附近无记录怪点(怪追来打的)" if not near else
                      "怪点无编号(清单太旧?)")))
 
+    def _gain_record(self):
+        """★ v19.3/v3: 一场打完 -> 算本场收益, 累加进会话累计, 写 exp_log.json。
+
+        单场 = 战后快照 - 战前快照 (fight 开头拍的 _gain_pre); 经验取各槽
+               增量的最大值 (= 每个在队角色实际拿到的那一份);
+        ★ 会话累计 = **逐场累加**已入账的单场收益 (self._gain_exp_tot += d)。
+          旧写法"当前快照 - 会话基线"在升级/满级循环/读档时基线整段作废,
+          累计被反复清零 -> 时均明显偏小 (2026-10-14 真机: 会话累计只记到
+          1,975, 而最近 200 场合计就 114,715; 根因是 wExp 是"等级内经验",
+          升级会掉阈值 -> 被误判成读档, 见 bot_explog 模块头)。
+        脏数据 (负值/超限, 见 gainlog.snap_delta) -> **只跳过本场**, 累计不重置,
+          记 bad 计数。失败只跳过, 绝不影响挂机。
+        """
+        cur = self.mem.read_gain() if hasattr(self.mem, "read_gain") else None
+        pre, self._gain_pre = getattr(self, "_gain_pre", None), cur
+        if pre is None or cur is None:
+            return
+        tab = getattr(self, "_levelup_tab", None)
+        if not tab and hasattr(self.mem, "levelup_table"):
+            try:
+                tab = self.mem.levelup_table()
+            except Exception:
+                tab = None
+            self._levelup_tab = tab      # 读到就缓存 (换 exe 才需重读)
+        d = gainlog.snap_delta(pre, cur, table=tab)
+        if d is None:
+            # 读档回退 / 内存读花 -> 只跳过本场, **累计基线不动**
+            n = getattr(self, "_gain_bad", 0) + 1
+            self._gain_bad = n
+            self.log("[收益] 本场快照异常 -> 跳过 (累计不重置, 已跳过 %d 场)" % n)
+            return
+        d_exp, d_cash = d
+        self._gain_exp_tot = getattr(self, "_gain_exp_tot", 0) + max(0, d_exp)
+        self._gain_cash_tot = getattr(self, "_gain_cash_tot", 0) + max(0, d_cash)
+        self.gain_log.record(
+            wins=getattr(self, "battles_won", 0),
+            elapsed=time.time() - self._gain_t0,
+            t_start=time.strftime("%Y-%m-%d %H:%M:%S",
+                                  time.localtime(self._gain_t0)),
+            d_exp=self._gain_exp_tot,
+            d_cash=self._gain_cash_tot,
+            bad=getattr(self, "_gain_bad", 0),
+            last={"n": getattr(self, "battles_won", 0),
+                  "t": time.strftime("%H:%M:%S"),
+                  "exp": d_exp, "cash": d_cash})
+
     def _chest_oid(self, ck):
         """箱子格的要素对象序号 (清单里查不到 -> 0, 报告会退回按 K 匹配)。"""
         try:
@@ -2192,7 +2268,7 @@ class MemBot5(MemBot4):
             s = self.stat
             _ho, _hf = self.heal_stat()
             self.log("[要素] 怪点命中 %d / 走到没打 %d / 开箱 %d(试%d,空%d,试%d次计) / "
-                     "回退巡逻 %d / 补血成功%d失败%d / 绳子%d(试%d)%s"
+                     "回退巡逻 %d / 存盘成功%d失败%d / 绳子%d(试%d)%s"
                      % (s["mon_hit"], s["mon_visit"],
                         s["chest_ok"], s["chest_try"], s["chest_empty"],
                         self.CHEST_TRY_N,
@@ -2277,9 +2353,9 @@ if __name__ == "__main__":
     bot = MemBot5(max_battles=maxb, max_seconds=secs, stall_limit=stall)
     bot.log("[配置] 战斗攻击键 = %s (%s) — 不对可在 GUI「攻击键」改" % (_ak, _ak_src))
     try:
-        bot.log("[配置] 战后补血 = %s" % bot.heal_summary())
+        bot.log("[配置] 战后自动存盘 = %s" % bot.heal_summary())
     except Exception as _e:
-        bot.log("[配置] 战后补血配置读取失败 (本次不补血): %s" % _e)
+        bot.log("[配置] 存盘配置读取失败 (本次不存盘): %s" % _e)
     if stall >= 10 ** 9:
         bot.log("[配置] 无胜场保险已关闭 (stall=0)")
     try:

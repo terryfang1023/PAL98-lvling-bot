@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""test_heal.py — 战后自动补血宏 (pal_bot_heal.py, 2026-10-01) 的回归测试。
+"""test_heal.py — 菜单宏 (pal_bot_heal.py, 现用于"战后自动存盘") 的回归测试。
 
 被测对象:
   * HealMacro —— 按键序列宏本体。三道校验 (起点/开菜单/收尾) 的每一条
@@ -176,8 +176,9 @@ check("关不掉 -> 兜底被调过", esc.n == 1)
 print("=" * 66)
 print("第 5 节: 收尾没回到地图 -> 补 esc; 补完就好了")
 print("=" * 66)
-# POLL_TIMES=2: 收尾轮询会吃掉 F_STUCK, F_STUCK 两帧, 补 esc 后的轮询吃到 F_MAP
-g = FakeG([F_MAP, F_MENU, F_STUCK, F_STUCK, F_MAP])
+# 帧预算 (v19.1 起): a0 / a1 之后, 6 个中间键各先拍 1 帧查战斗 (吃 6 帧
+# F_STUCK), 收尾轮询 POLL_TIMES=2 再吃 2 帧 F_STUCK, 补 esc 后轮询吃 F_MAP
+g = FakeG([F_MAP, F_MENU] + [F_STUCK] * 6 + [F_STUCK, F_STUCK, F_MAP])
 r = macro(g).run(SEQ)
 check("补了 1 次 esc 后成功", r["ok"] is True and r["esc_extra"] == 1,
       "esc_extra=%d %s" % (r["esc_extra"], r["reason"]))
@@ -380,6 +381,55 @@ except ValueError as e:
     check("非法键要被拦", "ctrl" in str(e), str(e)[:40])
 check("heal_summary 对坏序列友好",
       any(w in Host([F_MAP]).heal_summary() for w in ("无效", "开启", "关闭")))
+
+# ======================================================================
+print("=" * 66)
+print("第 10 节: v19.1 中途战斗校验 —— 宏跑到一半进战斗, enter 绝不再发")
+print("=" * 66)
+# 事故指纹 (2026-10-10 用户报告): 怪游走贴身, 宏按完 esc 之后新战斗开始,
+# 下一个键 enter 落进战斗指令菜单 -> 选中"攻击" -> 停在"选人"等 180s 超时。
+# 战斗一开始就必须中止宏 (esc 多按无害, enter 绝不行)。
+
+
+def macro_battle_script(flags, frames):
+    """is_battle 按 flags 逐次返回; frames 是 shot() 的帧脚本。"""
+    it = iter(flags)
+    return HealMacro(shot=FakeG(frames).shot, key=lambda k: keys.append(k),
+                     log=lambda m: None,
+                     is_battle=lambda a: next(it, True),
+                     menu_feat=lambda a: ((0.5, 0.0) if a is F_MENU
+                                          else (0.0, 0.0)),
+                     menu_like=lambda red, tan: red > 0.2,
+                     escape=None, gap=GAP)
+
+
+# ① 战斗在第一个中间键之前开始 -> 只发了开菜单的 esc
+keys = []
+m = macro_battle_script([False, True], [F_MAP, F_MENU, F_STUCK])
+r = m.run(SEQ)
+check("中途进战斗 -> ok=False", r["ok"] is False, r["reason"])
+check("只发了开菜单的 esc", r["sent"] == ["esc"], str(r["sent"]))
+check("enter 一个都没发", "enter" not in r["sent"])
+check("原因提到战斗中止", "战斗" in r["reason"] and "中止" in r["reason"],
+      r["reason"])
+
+# ② 战斗在第 3 个键之前才开始 -> 前两个中间键照发, 之后立刻停
+keys = []
+m = macro_battle_script([False, False, False, True],
+                        [F_MAP, F_MENU, F_MAP, F_MAP, F_MAP, F_STUCK])
+r = m.run(SEQ)
+check("前两键照发后中止", r["sent"] == ["esc", "enter", "right"],
+      str(r["sent"]))
+check("中止后 enter 不再发",
+      "enter" not in r["sent"][len(["esc", "enter", "right"]):],
+      str(r["sent"]))
+check("ok=False", r["ok"] is False)
+
+# ③ 全程没进战斗 -> 宏不受影响 (中途校验透明)
+g = FakeG([F_MAP, F_MENU] + [F_MAP] * 6 + [F_MAP])
+r = macro(g).run(SEQ)
+check("无战斗时宏照常成功", r["ok"] is True and r["sent"] == SEQ,
+      r["reason"])
 
 # ======================================================================
 print("=" * 66)

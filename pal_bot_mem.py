@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import numpy as np
 import pal_bot as PB
 import wingeom
+import bot_explog                       # parse_snapshot (不 import pal_bot*, 无循环)
 
 k32 = ctypes.windll.kernel32
 OPEN_OK = 0x0010 | 0x0400
@@ -60,6 +61,13 @@ def _cfg_float(key, default):
 
 
 def find_pal_pid():
+    """标题含 "Pal" 的窗口 -> [(pid, 标题)]。
+
+    ★ 2026-10-12: 加 "挂机机器人" 排除 —— 以前只靠**大小写**侥幸不撞车
+      (游戏真标题 = `Pal Win95 [v3.0.2025.0616-dirty]`, 自家 GUI 标题里是
+      全大写的 "SDLPAL", 所以 `"Pal" in 标题` 恰好为假)。GUI 标题一旦
+      改成含 "Pal" 就被误当成游戏窗口去读内存, 显式排除掉这个雷。
+    """
     u32 = ctypes.windll.user32
     res = []
 
@@ -71,7 +79,7 @@ def find_pal_pid():
         if n:
             b = ctypes.create_unicode_buffer(n + 1)
             u32.GetWindowTextW(hwnd, b, n + 1)
-            if "Pal" in b.value:
+            if "Pal" in b.value and "挂机机器人" not in b.value:
                 res.append((pid.value, b.value))
         return True
     u32.EnumWindows(cb, 0)
@@ -122,6 +130,55 @@ class Mem:
                 "pal": W[(SCENE_ADDR - READ_AT) // 2 + 1],
                 "px": px, "py": py,
                 "K": ((px - 2 * py) // 32, (px + 2 * py - 32) // 32)}
+
+    # ------------------------------------------------------------------
+    #  ★ v19.3 战斗收益快照 (exp_log.json 的数据源)
+    # ------------------------------------------------------------------
+    GAIN_ADDR = 0x00C3C978     # gpGlobals->dwCash, 紧跟 Exp.rgPrimaryExp
+    GAIN_N = 52                # dwCash(4B) + rgPrimaryExp[6](8B/条) = 52B
+    #  标定: bot_itemmon.MONEY_ADDR 的注释 (源码布局 + 差分实测 + 量级验证)。
+    #  地址必须与 bot_itemmon.EXP_ADDR - 4 一致 (test_explog 钉住不变量)。
+
+    # ★ v3: 升级所需经验表 rgLevelUpExp[100] (= viewport - 0x1A24, 地址同
+    #   bot_itemmon.LEVELUPEXP_ADDR)。**索引 = 当前等级**。用途: 游戏里的 wExp
+    #   是"当前等级内"的经验 (升级时会掉一个阈值), 必须 +Σ_{l<level} table[l]
+    #   才换算成单调的"累计经验" (见 bot_explog.total_exp)。
+    LEVELUPEXP_ADDR = 0x00C3AED8
+    LEVELUPEXP_N = 100         # WORD × 100 (PAL MAX_LEVELS=99, 索引 0..99)
+
+    def read_gain(self):
+        """一次读出 (金钱, 六人等级内经验, 六人等级) 快照; 读不到返回 None。
+
+        复用 self.h 句柄 (不为 GUI 侧的 bot_itemmon 再开一个)。返回的是
+        **六人各自的 wExp/wLevel 列表**而不是总和 —— 战斗经验三人在队各拿
+        一份, "每人所得"要在差值阶段取最大值 (见 bot_explog.snap_delta);
+        wLevel 用来把"等级内经验"换算成"累计经验" (避免升级被误判成回退)。
+        """
+        buf = (ctypes.c_char * self.GAIN_N)()
+        got = ctypes.c_size_t()
+        if not k32.ReadProcessMemory(self.h, ctypes.c_void_p(self.GAIN_ADDR),
+                                     buf, self.GAIN_N, ctypes.byref(got)):
+            return None
+        if got.value < self.GAIN_N:
+            return None
+        return bot_explog.parse_snapshot(buf.raw)
+
+    def levelup_table(self):
+        """读 rgLevelUpExp[100] (WORD/条, 索引=当前等级); 读不到返回 None。
+
+        ★ 只影响"升级那一刻"的那一场读数: 拿不到时 bot_explog.total_exp
+          退回原值, 平时 (不升级) 相减结果完全一样 —— 所以读失败不致命,
+          不要因此打断记账。
+        """
+        n = self.LEVELUPEXP_N * 2
+        buf = (ctypes.c_char * n)()
+        got = ctypes.c_size_t()
+        if not k32.ReadProcessMemory(self.h, ctypes.c_void_p(self.LEVELUPEXP_ADDR),
+                                     buf, n, ctypes.byref(got)):
+            return None
+        if got.value < n:
+            return None
+        return list(struct.unpack('<%dH' % self.LEVELUPEXP_N, buf.raw[:n]))
 
     # ------------------------------------------------------------------
     #  只读自检: 硬编码基址在当前游戏进程里是否仍然成立 (v17.2)

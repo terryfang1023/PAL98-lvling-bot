@@ -89,6 +89,18 @@ class MemBot4(HealMixin, MemBot3):
     ANIM_BIG = 8000           # (旧)画面剧烈变化的像素阈值; 现用 MemBot.F_ANIM_BIG
     END_CONFIRM = 2           # 连续 N 次「非战斗 + 画面静止」= 真结束
     KEY_F_GAP = 0.60          # 两次攻击键之间的间隔 (等一击动画走完)
+    # ★ v19.1 战斗卡死保护: 攻击键 (R=重复) 在"选目标/选人"等待态**无效**,
+    #   画面会一直静止到 180s 超时 (真机 2026-10-10 用户报告, 小概率:
+    #   回车把指令菜单打成选人, R 救不回来, 按一下 esc 就能退回指令层)。
+    #   画面静止超过这么久 -> esc 一次, 让 R 重新有用。
+    #   注意别设太小: 战斗里"等对方行动"的间隙也可能静止一两秒。
+    FIGHT_STILL_LIMIT = 6.0
+    # ★ v19.2 长战斗无进展兜底: R(重复) 连按这么多次 / 战斗超 LONG_BATTLE 秒
+    #   还没打完 -> 周期性 esc。为什么不能只靠上面的静止检测: 角色待机动画
+    #   让帧间差高达 6~13 万像素 (>> anim_min=300), 静止检测恒判"在动"
+    #   (2026-10-12 真机 14 帧实测; 178 场 180s 超时只有 13 场触发过静止保护)。
+    F_R_ESC_N = 20
+    ESC_EVERY = 8.0           # 兜底 esc 的最小间隔 (秒), 与 LONG_BATTLE 分支共用
 
     def __init__(self, *a, **kw):
         super().__init__(*a, **kw)
@@ -587,6 +599,18 @@ class MemBot4(HealMixin, MemBot3):
                  % (dt, n, streak))
         return ("menu", dt)
 
+    def _frames_moved(self, a, b):
+        """两帧之间画面是否"明显在动" (攻击/施法动画 = 有进展)。
+
+        选目标的箭头闪烁只有几十个像素, 算**没动** —— 正是要抓的状态。
+        帧不可比较 (测试打桩 dict / 形状不一致 / 阈值换算失败) -> 按
+        "在动"处理: 宁可不触发保护, 也绝不误按 esc。
+        """
+        try:
+            return self._diffpix(a, b) >= self.px_thr(self.F_ANIM_MIN)
+        except Exception:
+            return True
+
     def fight(self, why=""):
         self._chase_tries = {}      # 开打了: 追怪计数清零 (怪是真的)
         self._chase_goal = None     # 目标已达成, 解除"不记绕行"保护
@@ -646,6 +670,9 @@ class MemBot4(HealMixin, MemBot3):
         lost = 0
         reason = "未知"
         last_esc = 0.0
+        prev_a = None            # 上一帧 (卡死保护用)
+        last_move = 0.0          # 上次"画面明显在动"的时刻 (over 时间轴)
+        wd_esc = 0               # 卡死保护已按 esc 的次数
         while True:
             over = time.time() - t0
             if over > BATTLE_MAX:
@@ -666,6 +693,36 @@ class MemBot4(HealMixin, MemBot3):
                 #   开着)恒真; 法术页无数字仍是 ui_menu+esc, 旧担忧已由
                 #   v2 化解。
                 lost = 0
+                # ★ v19.2 长战斗无进展兜底 (mem2 老逻辑重写时丢失, 现补回):
+                #   真战斗 ~9 秒 / 正常只需 R 1~2 次; R 连按 F_R_ESC_N 次或超
+                #   LONG_BATTLE 还没打完 -> 多半停在"选目标/选人"等待态 (R 无效,
+                #   2026-10-12 真机实拍: 选择箭头悬在角色头上, 一卡就是 180s)。
+                #   esc 关掉选人等待后 R 恢复有效 (2026-10-10 三场实测均被救回)。
+                #   兜底 esc 与下面的 LONG_BATTLE 分支共用 last_esc/ESC_EVERY。
+                if (n_f >= self.F_R_ESC_N or over > self.LONG_BATTLE) \
+                        and over - last_esc > self.ESC_EVERY:
+                    last_esc = over
+                    self.press_esc()
+                    self.log("[战斗] 长战斗无进展 (R×%d / %.0fs) -> esc 兜底"
+                             % (n_f, over))
+                    continue
+                # ★ v19.1 卡死保护 (先看画面, 再发键):
+                #   攻击键在"选目标/选人"等待态无效, 画面静止但 is_battle
+                #   恒真 -> 死循环到超时。静止超过 FIGHT_STILL_LIMIT ->
+                #   esc 退回指令层, R 就又有用了。
+                if self._frames_moved(prev_a, a):
+                    last_move = over
+                    wd_esc = 0
+                elif over - last_move > self.FIGHT_STILL_LIMIT:
+                    wd_esc += 1
+                    last_move = over
+                    prev_a = None
+                    self.press_esc()
+                    self.log("[战斗] 卡死保护: 攻击键 %.0fs 无画面进展 "
+                             "(疑似停在选目标/选人, R 无效) -> esc #%d"
+                             % (self.FIGHT_STILL_LIMIT, wd_esc))
+                    time.sleep(0.4)
+                prev_a = a
                 self.g.attack()          # ★ 战斗攻击键 (默认 R=重复上次行动, GUI 可调)
                 n_f += 1
                 time.sleep(self.KEY_F_GAP)
@@ -674,7 +731,7 @@ class MemBot4(HealMixin, MemBot3):
                 # 菜单类画面且无战斗特征 (法术页/系统菜单) -> 只按 esc
                 self.press_esc()
                 continue
-            if over > self.LONG_BATTLE and over - last_esc > 8.0:
+            if over > self.LONG_BATTLE and over - last_esc > self.ESC_EVERY:
                 last_esc = over
                 self.press_esc()
                 continue
@@ -701,6 +758,16 @@ class MemBot4(HealMixin, MemBot3):
                 break
             time.sleep(0.35)
             self.g.key("space")
+            # ★ v19.2: space 在游戏里 = "确认"。若恰逢新战斗淡入 (battle_screen
+            #   还认不出暗场), 这一下会把战斗指令菜单直接打成"选人"等待态
+            #   (2026-10-12 用户实拍的卡死根源: 机器人从不按 enter, 但 space
+            #   同为确认键)。按完复查一次: 真开打了 -> esc 撤销刚才的误确认
+            #   (esc 在战斗内只取消当前选择, 无害 —— 10-10 三场实测均被救回)。
+            time.sleep(0.4)
+            if self.battle_screen():
+                self.press_esc()
+                self.log("[战斗] 结算 space 落进新战斗 -> esc 撤销误确认")
+                break
         self.g.flush_keys()
         # ③.5 等结算画面/淡入散场 (v18.7): 补血宏的基准帧 a0 必须是
         #   "稳定的地图"。否则 a0 拍到淡入中的半暗画面, 宏按完后画面回到
@@ -725,9 +792,9 @@ class MemBot4(HealMixin, MemBot3):
         #   都在 after_battle_heal 里判断, 关掉时一个键都不发。
         if n_f >= 1:
             try:
-                self.after_battle_heal(why="战后补血 #%d" % self.battles_won)
-            except Exception as e:                 # 补血绝不能把主循环带崩
-                self.log("[补血] 异常, 已忽略: %s" % e)
+                self.after_battle_heal(why="自动存盘 #%d" % self.battles_won)
+            except Exception as e:                 # 存盘绝不能把主循环带崩
+                self.log("[存盘] 异常, 已忽略: %s" % e)
         return True
 
     def _settle_screen(self, timeout=3.0):

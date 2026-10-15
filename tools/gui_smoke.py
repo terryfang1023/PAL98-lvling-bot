@@ -16,6 +16,17 @@
      直接清 0、运行中只写 win_reset.flag (等机器人自己兑现) 且界面标「(待清空)」;
      「要素台账」勾选框 -> PAL_FEAT_LOG; 「要素覆盖率」按钮 -> tools/feat_report.py。
   ⑩ 攻击键非法时被拦下 (不起子进程), 合法值被规范化。
+  ⑪ 版本号显示 (2026-10-12): 窗口标题 + 底部状态区都要带 botcfg.APP_VERSION;
+  ⑫ 战斗收益左栏 (v19.3): 左收益右日志分栏, exp_log.json 只读 + 缺文件容错;
+     ★ v3 口径: bad>0 显示「跳过 N 场」, 旧版本台账 (v1 虚高/v2 时均偏小) 不展示。
+  ⑬ 窗口比例 (2026-10-13): 控件请求尺寸接近 4:3 (宽/高 1.20~1.45) —— 用户嫌
+     原布局"太宽", 参数/按钮重排后整窗收敛到 960x720 = 1.333。
+  ⑭ 程序图标 (2026-10-13): assets/pal98bot.ico 多尺寸 32bpp (16/32 必备),
+     GUI 接 iconbitmap + WM_SETICON 且文件缺失时静默跳过 (只拷 .py 不拷
+     assets 也能开)。★任务栏 = AUMID(建窗前) + WM_SETICON 三连 —— 只
+     iconbitmap 时 Win11 任务栏显示"白纸" (真机取证)。
+     并钉死「标题不许含大小写敏感的 'Pal'」—— 那是找游戏窗口的判据, 撞上就会
+     把自家 GUI 当成游戏去读内存。
 
 零副作用: 停止标志与 bot_config.json **都重定向到临时目录** ——
   前者曾经把正在跑的机器人停掉, 后者会把用户真实的攻击键设置改掉;
@@ -26,6 +37,7 @@
        需要带 tkinter 的解释器 (如 C:/Python311/python.exe; anaconda 也行)。
 """
 import os
+import re
 import sys
 import time
 import types
@@ -69,6 +81,11 @@ bot_featlog.FEATLOG_PATH = os.path.join(_TMPDIR, "feat_log.json")
 assert os.path.dirname(bot_featlog.FEATLOG_PATH) != BASE, "自检绝不能碰运行目录的要素台账"
 if hasattr(G, "bot_featlog"):
     G.bot_featlog.FEATLOG_PATH = bot_featlog.FEATLOG_PATH
+# 同理 (v19.3): 战斗收益 exp_log.json —— GUI 左栏会读它 (只读), 但为防将来
+# 写路径混进来, 一并重定向 + 断言。
+G.bot_explog.EXPLOG_PATH = os.path.join(_TMPDIR, "exp_log.json")
+assert os.path.dirname(G.bot_explog.EXPLOG_PATH) != BASE, \
+    "自检绝不能碰运行目录的战斗收益台账"
 
 # 预置一个"用户已经改过攻击键"的配置, 用来验证界面真的会读它 (而不是只显示默认值)
 with open(G.botcfg.CONFIG_PATH, "w", encoding="utf-8") as _f:
@@ -100,6 +117,23 @@ _CFG_BEFORE = _cfg_state()
 _CHEST_BEFORE = _chest_state()
 _WIN_BEFORE = _file_state("win_total.json")
 _FEAT_BEFORE = _file_state("feat_log.json")
+
+
+def _not_shrunk(name, before):
+    """台账文件「没被写小」(零副作用断言的活机器人健壮版)。
+
+    机器人每赢一场就写 win_total.json / feat_log.json (只增不删),
+    自检跑几秒的窗口里必然撞车 —— 2026-10-12 实测: 机器人在跑时
+    size+mtime 快照相等断言误报 2 项。所以退化成「运行目录那份没有被
+    清小」: 自检若误把真台账清掉, 文件一定变小, 仍然抓得住。
+    真正防误写靠的是 WINS_PATH / FEATLOG_PATH / RESET_FLAG 全部
+    重定向进临时目录的断言 (见下文)。"""
+    a = _file_state(name)
+    if not a[0]:
+        return not before[0]          # 都不存在 = 没动
+    if not before[0]:
+        return True                   # 新建 (机器人首胜建的; 误写由重定向断言兜底)
+    return a[1] >= before[1]          # 只许长大, 不许变小
 
 
 def check(name, cond, extra=""):
@@ -191,9 +225,9 @@ def main():
               os.path.dirname(G.botcfg.CONFIG_PATH) != BASE,
               G.botcfg.CONFIG_PATH)
 
-        print("①c 战后补血 (界面 -> PAL_HEAL_* 环境变量)")
+        print("①c 战后自动存盘 (界面 -> PAL_HEAL_* 环境变量)")
         env1 = cap.get("kw", {}).get("env", {})
-        check("界面默认勾上战后补血", app.v_heal.get() is True,
+        check("界面默认勾上战后自动存盘", app.v_heal.get() is True,
               str(app.v_heal.get()))
         check("PAL_HEAL_AFTER_BATTLE 已传 (开)",
               env1.get("PAL_HEAL_AFTER_BATTLE") == "1",
@@ -208,7 +242,7 @@ def main():
               float(env1.get("PAL_HEAL_GAP", "0") or 0) > 0,
               str(env1.get("PAL_HEAL_GAP")))
         _cfg1 = G.botcfg.load(G.botcfg.CONFIG_PATH)
-        check("补血四项落盘到 (临时) 配置文件",
+        check("存盘四项落盘到 (临时) 配置文件",
               _cfg1.get("heal_after_battle") is True
               and _cfg1.get("heal_seq") == G.botcfg.SEQ_DEFAULT,
               str(_cfg1))
@@ -371,7 +405,7 @@ def main():
             app._err = real_err
             app.v_atk.set("r")
 
-        print("⑧b 补血序列非法 -> 拦下且不起进程")
+        print("⑧b 存盘序列非法 -> 拦下且不起进程")
         app.proc = None
         cap.clear()
         errs = []
@@ -635,7 +669,7 @@ def main():
               "%s / %s" % (G.bot_winlog.WinLog().total(),
                            app.v_wins_total.get()))
         check("清空走的是临时目录那份 win_total.json (运行目录没动)",
-              _file_state("win_total.json") == _WIN_BEFORE,
+              _not_shrunk("win_total.json", _WIN_BEFORE),
               "前 %s -> 后 %s" % (_WIN_BEFORE, _file_state("win_total.json")))
 
         # 机器人在跑 -> 只能写 win_reset.flag, 让机器人自己兑现
@@ -680,7 +714,7 @@ def main():
               str(((cap.get("kw") or {}).get("env") or {}).get("PAL_FEAT_LOG")))
         app.proc = None
         check("运行目录的 feat_log.json 没被动过 (零副作用)",
-              _file_state("feat_log.json") == _FEAT_BEFORE,
+              _not_shrunk("feat_log.json", _FEAT_BEFORE),
               "前 %s -> 后 %s" % (_FEAT_BEFORE, _file_state("feat_log.json")))
 
         # 「要素覆盖率」按钮 -> 后台跑 tools/feat_report.py (只 stub 子进程, 不真跑)
@@ -698,10 +732,161 @@ def main():
                   "tools/feat_report.py"), " ".join(str(x) for x in a9))
         check("覆盖率报告不写停止标志 (只读的工具)",
               os.path.dirname(G.STOP_FLAG) != BASE, G.STOP_FLAG)
-        check("★ win_total.json / win_reset.flag 都没落在运行目录",
-              _file_state("win_total.json") == _WIN_BEFORE
+        check("★ win_total.json 没被写小 / win_reset.flag 没落在运行目录",
+              _not_shrunk("win_total.json", _WIN_BEFORE)
               and _file_state("win_reset.flag")[0] is False,
               str(_file_state("win_total.json")))
+
+        # ---- ⑪ 版本号显示 (2026-10-12) ----
+        # 为什么要测: 界面上看不出跑的是哪一版, 刚改完 bug 想确认新版有没有真生效
+        # 时只能靠猜。另外版本号出现在窗口标题里 —— 而机器人/GUI 找游戏窗口用的
+        # 判据是「标题含 'Pal'」(游戏真标题 = `Pal Win95 [...]`), 自家 GUI 靠
+        # 全大写的 "SDLPAL" 侥幸不撞车 -> 标题里一旦混进大小写敏感的 "Pal",
+        # 机器人就会把 GUI 当游戏去读内存。这条断言把这个雷钉死。
+        print("⑪ 版本号显示 + 标题不撞游戏窗口判据")
+        check("botcfg.APP_VERSION 存在且像个版本号",
+              isinstance(G.botcfg.APP_VERSION, str)
+              and G.botcfg.APP_VERSION.startswith("v")
+              and len(G.botcfg.APP_VERSION) > 2,
+              repr(getattr(G.botcfg, "APP_VERSION", None)))
+        check("★ APP_VERSION 里不含 'Pal' (大小写敏感, 游戏窗口判据)",
+              "Pal" not in G.botcfg.APP_VERSION, G.botcfg.APP_VERSION)
+        check("窗口标题带版本号", G.botcfg.APP_VERSION in root.title(), root.title())
+        check("★ 窗口标题里不含 'Pal' (否则机器人会误认成游戏窗口)",
+              "Pal" not in root.title(), root.title())
+        check("标题仍然是自家 GUI (含「挂机机器人」, 排除逻辑仍然生效)",
+              "挂机机器人" in root.title(), root.title())
+        check("底部状态区有版本号显示位",
+              hasattr(app, "v_ver")
+              and G.botcfg.APP_VERSION in app.v_ver.get(), app.v_ver.get())
+        check("版本号只有一个来源 (底部显示 == APP_VERSION, 无副本)",
+              app.v_ver.get().endswith(G.botcfg.APP_VERSION), app.v_ver.get())
+
+        # ---- ⑫ 战斗收益左栏 (v19.3, exp_log.json) ----
+        # 为什么要测: 左栏数据来自机器人子进程写的 exp_log.json, GUI 只读;
+        # 文件不存在 (机器人从没跑过/刚清掉) 时绝不能弹错、也不能崩。
+        print("⑫ 战斗收益左栏 (左日志右收益分栏)")
+        check("左栏树表存在", hasattr(app, "tree_gain"))
+        check("左栏统计显示位存在",
+              hasattr(app, "v_gain_sum") and hasattr(app, "v_gain_rate"))
+        # 空文件场景: 载入失败 -> 保持原显示, 不异常
+        app._gain_refresh()
+        check("exp_log.json 缺失时 _gain_refresh 不崩", True)
+        # 塞一份台账进临时目录 -> 刷新后左栏要显示出来
+        G.bot_explog.GainLog().record(
+            wins=7, elapsed=3600.0, t_start="2026-10-13 10:00:00",
+            d_exp=6844, d_cash=658,
+            last={"n": 7, "t": "11:00:00", "exp": 62, "cash": 94})
+        app._gain_refresh()
+        check("统计行显示累计",
+              "+6844" in app.v_gain_sum.get() and "+658" in app.v_gain_sum.get(),
+              app.v_gain_sum.get())
+        check("时均行显示 1 小时均值",
+              "6,844" in app.v_gain_rate.get() and "658" in app.v_gain_rate.get(),
+              app.v_gain_rate.get())
+        rows = app.tree_gain.get_children()
+        check("列表显示最近一场", len(rows) == 1
+              and "#7" in str(app.tree_gain.item(rows[0], "values")),
+              str(app.tree_gain.item(rows[0], "values") if rows else "-"))
+        # ★ exp_log.json 只落在临时目录。运行目录那份是**机器人**写的 (每胜一场
+        #   就重写), 不能断言"不存在" —— 机器人跑着时会误报; 判据 = 它不含有
+        #   本自检写进去的独特标记 (t_start="2026-10-13 10:00:00")。只读。
+        _real = os.path.join(BASE, "exp_log.json")
+        _touched = False
+        if os.path.exists(_real):
+            try:
+                with open(_real, encoding="utf-8") as fh:
+                    _touched = "2026-10-13 10:00:00" in fh.read()
+            except Exception:
+                pass
+        check("★ exp_log.json 只落在临时目录 (运行目录那份不是自检写的)",
+              os.path.dirname(G.bot_explog.GainLog().path) == _TMPDIR
+              and not _touched, _real)
+        # ★ v3 口径: bad>0 时统计行要给出「跳过 N 场」提示 (时均偏低的线索)
+        G.bot_explog.GainLog().record(
+            wins=8, elapsed=3600.0, t_start="2026-10-13 10:00:00",
+            d_exp=6906, d_cash=700, bad=3,
+            last={"n": 8, "t": "11:00:00", "exp": 62, "cash": 42})
+        app._gain_refresh()
+        check("bad>0 -> 统计行提示跳过场次",
+              "跳过 3 场" in app.v_gain_sum.get(), app.v_gain_sum.get())
+        # ★ 旧口径 (version != VERSION) 的台账不展示 (v1 虚高 / v2 时均偏小)
+        import json as _json
+        with open(G.bot_explog.GainLog().path, "w", encoding="utf-8") as fh:
+            _json.dump({"version": 2, "t_start": "old", "elapsed": 10.0,
+                        "wins": 99, "d_exp": 12481, "d_cash": 658,
+                        "last": {"n": 99, "t": "x", "exp": 62, "cash": 94},
+                        "battles": [{"n": 99, "t": "x", "exp": 62, "cash": 94}]},
+                       fh)
+        app._gain_refresh()
+        check("★ 旧口径台账不显示 (避免用户被错数迷惑)",
+              "旧口径" in app.v_gain_sum.get()
+              and "12481" not in app.v_gain_sum.get()
+              and not app.tree_gain.get_children(),
+              app.v_gain_sum.get())
+        # 复原成新口径, 免得后面的检查看到"旧口径"提示
+        G.bot_explog.GainLog().record(
+            wins=8, elapsed=3600.0, t_start="2026-10-13 10:00:00",
+            d_exp=6906, d_cash=700,
+            last={"n": 8, "t": "11:00:00", "exp": 62, "cash": 42})
+        app._gain_refresh()
+        check("新口径台账恢复正常显示",
+              "+6906" in app.v_gain_sum.get(), app.v_gain_sum.get())
+
+        # ---- ⑬ 窗口比例 ≈4:3 (2026-10-13) ----
+        # 为什么要测: 用户嫌"整窗太宽"。重排后请求尺寸 = 914x719 (宽/高 1.27),
+        # 默认 geometry 960x720 = 1.333。用"请求比例"做断言 (区间放宽到
+        # 1.20~1.45, 字体/DPI 有浮动); 若哪天又把参数行加宽了, 这里会叫。
+        # 注意窗口是 withdraw 的, winfo_width 恒为 1 —— 只能查 geometry 字符串。
+        print("⑬ 窗口比例 ≈4:3")
+        _rw, _rh = root.winfo_reqwidth(), root.winfo_reqheight()
+        _ratio = _rw / float(max(1, _rh))
+        check("整窗请求比例接近 4:3 (1.20 ~ 1.45)",
+              1.20 <= _ratio <= 1.45, "%dx%d = %.3f" % (_rw, _rh, _ratio))
+        _m = re.match(r"(\d+)x(\d+)", root.geometry() or "")
+        _gw = int(_m.group(1)) if _m else 0
+        _gh = int(_m.group(2)) if _m else 0
+        check("默认 geometry 是 4:3 (±2%)",
+              _gw and _gh and abs(_gw / float(_gh) - 4.0 / 3.0) <= 0.02,
+              root.geometry())
+
+        # ---- ⑭ 程序图标 (2026-10-13) ----
+        # 为什么要测: 图标文件是"锦上添花", 但用户特意要求任务栏能认出机器人;
+        # 这里钉三件事: ① 文件在且是合法的多尺寸 ICO (16/32 必须有 —— 任务栏
+        # 用的就是这两档); ② GUI 接了 iconbitmap; ③ 文件缺失时绝不炸 (别人只
+        # 拷 .py 不拷 assets/ 也要能开界面)。
+        print("⑭ 程序图标 (任务栏/标题栏)")
+        check("assets/pal98bot.ico 存在", os.path.exists(G.ICON_PATH),
+              G.ICON_PATH)
+        if os.path.exists(G.ICON_PATH):
+            with open(G.ICON_PATH, "rb") as fh:
+                head = fh.read(6 + 16 * 32)
+            _cnt = int.from_bytes(head[4:6], "little")
+            _sizes = set()
+            for _i in range(_cnt):
+                _o = 6 + 16 * _i
+                _w, _h = head[_o], head[_o + 1]          # 0 表示 256
+                _bpp = int.from_bytes(head[_o + 6:_o + 8], "little")
+                _sizes.add(((_w or 256), (_h or 256), _bpp))
+            check("ICO 是多尺寸 32bpp (16/32 必备)", _cnt >= 5
+                  and (16, 16, 32) in _sizes and (32, 32, 32) in _sizes,
+                  sorted(_sizes))
+        srcg = open(os.path.join(BASE, "bot_gui.py"), encoding="utf-8").read()
+        check("GUI 接了图标 (iconbitmap + WM_SETICON + 容错函数)",
+              "iconbitmap" in srcg and "_apply_icon" in srcg
+              and "_win_taskbar_icon" in srcg and "ICON_PATH" in srcg)
+        # 任务栏图标 = AUMID(建窗前注册) + WM_SETICON 三连 (small/big/small2)。
+        # 真机教训: 只 iconbitmap 时 Win11 任务栏显示"白纸", 见 _set_aumid 注释。
+        check("显式 AUMID 在建窗前注册 (模块加载即调用)",
+              "APP_AUMID" in srcg and "SetCurrentProcessExplicitAppUserModelID"
+              in srcg and srcg.index("_set_aumid()") < srcg.index("def main("))
+        check("WM_SETICON 挂了 small/big/small2 三档",
+              "WM_SETICON" in srcg and "(2, small)" in srcg)
+        try:
+            app._apply_icon(root, os.path.join(_TMPDIR, "不存在的.ico"))
+            check("图标文件缺失时静默跳过 (不炸界面)", True)
+        except Exception as _ex:
+            check("图标文件缺失时静默跳过 (不炸界面)", False, repr(_ex))
     finally:
         G.subprocess = real_subprocess
         if os.path.exists(G.STOP_FLAG):

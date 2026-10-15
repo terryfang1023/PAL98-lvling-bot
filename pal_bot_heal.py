@@ -1,13 +1,18 @@
 # -*- coding: utf-8 -*-
-"""战后自动补血 (菜单宏) —— pal_bot_heal.py
+"""自动存盘 (菜单宏引擎) —— pal_bot_heal.py
 
-用户诉求 (2026-10-01): 新地图战斗很吃力, 希望**每场战斗后自动把血加满**。
-游戏里补血不是"按一个键", 而是一条固定的菜单路径 (用户真机实测给出):
+本模块是**通用的菜单按键宏**: "跑一条固定的菜单路径 + 四道校验",
+游戏侧功能由 heal_seq 里那条序列决定。模块名/函数名沿用 2026-10-01
+的 heal 历史名 (改名会牵动机器人接线与测试, 收益不大)。
 
-    ESC 开系统菜单 (光标默认停在第二项「仙术」)
-      -> 回车 (人物选择菜单上直选「巫后」)
-      -> 右 -> 回车 -> 回车 -> 右 -> 回车
-      -> ESC 关菜单
+历史: 2026-10-01 做的是"战后自动补血" (每场打完加满血), 序列 = 用户真机实测
+的补血菜单路径; 2026-10-13 用户改用**自动存盘** (人物都 99 级, 补血没用了),
+只把序列与界面文字换成存档路径, 引擎一行没动:
+
+    ESC 开菜单 -> 系统 -> 存档 -> 选档位 (存完游戏自动回地图, 不用补 esc)
+
+★ 存档路径务必先用 GUI「存盘测试」真按一遍验证: 系统菜单里「退出」「读档」
+  是危险项, 序列错位会退出游戏/读回旧档。
 
 本模块把这条路径做成**可配置宏** (键序列写在 bot_config.json / GUI 里),
 并且加上三道校验, 坏掉时能自己退出菜单, 而不是把机器人卡在菜单里。
@@ -27,6 +32,9 @@
   ③ 收尾校验: 序列跑完必须"画面回到开宏前那张地图"。没回来就补 esc
      (最多 MAX_ESC_RETRY 次), 仍不回就走宿主自己的 escape_menu() 兜底,
      并进入 BAIL_CD 冷却; 连续失败 FAIL_LIMIT 次 -> 本次运行内自动停用。
+  ④ 中途战斗校验 (v19.1): **每个中间键发之前**确认没进新战斗 ——
+     怪游走贴身无需走路也能触发战斗, 宏跑到一半的 enter 落进战斗
+     指令菜单会把"攻击"选上、停在选人。战斗一开始立刻中止宏。
 
 为什么校验要"画面差异 + 菜单特征"双判:
     mem2 的菜单特征 (中央暗红面板 red + 左侧棕黄卷轴 tan) 在熔岩地图上
@@ -106,8 +114,8 @@ class HealMacro:
             diff_frac(a0, frame) <= SETTLE_FRAC
 
     # ---------------- 主流程 ----------------
-    def run(self, keys, why="战后补血"):
-        """执行一次补血宏。返回结果 dict (ok / reason / sent / opened / closed)。"""
+    def run(self, keys, why="自动存盘"):
+        """执行一次菜单宏。返回结果 dict (ok / reason / sent / opened / closed)。"""
         keys = list(keys or [])
         res = {"ok": False, "reason": "", "sent": [], "opened": False,
                "closed": False, "esc_extra": 0, "elapsed": 0.0,
@@ -121,19 +129,19 @@ class HealMacro:
         if self.is_battle is not None:
             try:
                 if self.is_battle(a0):
-                    res["reason"] = "当前在战斗里 -> 不补血"
+                    res["reason"] = "当前在战斗里 -> 不执行 (菜单打不开)"
                     return res
             except Exception:
                 pass
         # ① 起点校验: 已经在菜单里就先关掉, 保证序列从"地图"开始按
         if self._is_menu(a0):
-            self.log("[补血] 起始画面像菜单 -> 先关掉再执行宏 (起点必须在地图上)")
+            self.log("[存盘] 起始画面像菜单 -> 先关掉再执行宏 (起点必须在地图上)")
             if self.escape is not None:
                 self.escape()
                 time.sleep(0.4)
             a0 = self.shot()
             if self._is_menu(a0):
-                res["reason"] = "已有菜单关不掉 -> 放弃本次补血"
+                res["reason"] = "已有菜单关不掉 -> 放弃本次"
                 res["elapsed"] = time.time() - t0
                 return res
 
@@ -148,8 +156,22 @@ class HealMacro:
             res["elapsed"] = time.time() - t0
             return res
 
-        # ③ 中间键
+        # ③ 中间键 —— ★ v19.1 每键前查战斗: 怪游走贴身会在宏跑到一半时
+        #   触发新战斗 (无需走路也会发生), 这时再按 enter 就会把战斗指令
+        #   菜单打成"选攻击/选人", 机器人从此停在选目标等 180s 超时
+        #   (真机 2026-10-10 用户报告)。战斗一开始立刻中止宏, 剩下的
+        #   键一个都不发, 交给战斗循环处理 (esc 多按无害, enter 绝不行)。
         for k in keys[1:-1]:
+            if self.is_battle is not None:
+                try:
+                    if self.is_battle(self.shot()):
+                        res["reason"] = ("战斗中途开始 -> 中止宏 (已发 %d 键, "
+                                         "防 enter 误选攻击)"
+                                         % len(res["sent"]))
+                        res["elapsed"] = time.time() - t0
+                        return res
+                except Exception:
+                    pass
             self._do(k, res)
 
         # ④ 收尾: 关菜单 + 校验画面回到地图
@@ -162,7 +184,7 @@ class HealMacro:
                 break
         while not closed and res["esc_extra"] < MAX_ESC_RETRY:
             res["esc_extra"] += 1
-            self.log("[补血] 收尾校验: 画面还没回到地图 -> 补第 %d 次 esc"
+            self.log("[存盘] 收尾校验: 画面还没回到地图 -> 补第 %d 次 esc"
                      % res["esc_extra"])
             self._do("esc", res)
             for _ in range(3):
@@ -171,7 +193,7 @@ class HealMacro:
                     closed = True
                     break
         if not closed and self.escape is not None:
-            self.log("[补血] 收尾校验仍不过 -> 交给 escape_menu() 兜底")
+            self.log("[存盘] 收尾校验仍不过 -> 交给 escape_menu() 兜底")
             try:
                 self.escape()
             except Exception:
@@ -199,7 +221,7 @@ class HealMacro:
 
 
 class HealMixin:
-    """给 MemBot 系列加"战后自动补血"。
+    """给 MemBot 系列加"战后自动存盘"。
 
     宿主 (MemBot4 及其子类) 需要提供:
       self.g.shot() / self.g.key(name) / self.g.flush_keys()
@@ -212,7 +234,7 @@ class HealMixin:
     #  配置: 环境变量 > bot_config.json > 默认值  (走 botcfg, 见其文档)
     # ------------------------------------------------------------------
     def heal_load(self, path=None, force=False):
-        """读补血配置 (只读一次, 之后缓存; force=True 强制重读)。"""
+        """读存盘配置 (只读一次, 之后缓存; force=True 强制重读)。"""
         if getattr(self, "_heal_cfg", None) is not None and not force:
             return self._heal_cfg
         cfg = {"on": False, "keys": [], "every": 1, "gap": DEFAULT_GAP,
@@ -228,7 +250,7 @@ class HealMixin:
             cfg["gap"] = max(0.05, gap if gap > 0 else DEFAULT_GAP)
             cfg["src"] = "%s / %s / %s / %s" % (s1, s2, s3, s4)
         except ValueError as e:
-            # 序列写错了: 不抛异常, 只停用补血 (机器人照常跑)
+            # 序列写错了: 不抛异常, 只停用存盘 (机器人照常跑)
             cfg["on"] = False
             cfg["err"] = str(e)
             cfg["src"] = "配置无效"
@@ -254,8 +276,8 @@ class HealMixin:
     # ------------------------------------------------------------------
     #  执行
     # ------------------------------------------------------------------
-    def heal_macro(self, why="战后补血"):
-        """跑一次补血宏, 返回 HealMacro.run 的结果 dict (不判断开关/场次)。"""
+    def heal_macro(self, why="自动存盘"):
+        """跑一次菜单宏, 返回 HealMacro.run 的结果 dict (不判断开关/场次)。"""
         m = HealMacro(shot=self.g.shot, key=self.g.key, log=self.log,
                       is_battle=lambda a: self._heal_is_battle(a),
                       menu_feat=self._menu_feat, menu_like=self._menu_like,
@@ -276,7 +298,7 @@ class HealMixin:
     def _heal_gap(self):
         return self.heal_load()["gap"]
 
-    def after_battle_heal(self, why="战后补血"):
+    def after_battle_heal(self, why="自动存盘"):
         """战斗结束后调用。返回 True = 这次真的跑完了宏。
 
         开关/场次/冷却/连败停用都在这儿判断 —— 关掉时一个键都不发。
@@ -285,7 +307,7 @@ class HealMixin:
         if cfg["err"]:
             if not getattr(self, "_heal_err_logged", False):
                 self._heal_err_logged = True
-                self.log("[补血] 已停用: 键序列配置无效 (%s)" % cfg["err"])
+                self.log("[存盘] 已停用: 键序列配置无效 (%s)" % cfg["err"])
             return False
         if not cfg["on"]:
             return False
@@ -293,7 +315,7 @@ class HealMixin:
             return False
         now = time.time()
         if now < getattr(self, "_heal_bail_t", 0.0):
-            self.log("[补血] 上次失败, 冷却中 (剩 %.0fs) -> 跳过"
+            self.log("[存盘] 上次失败, 冷却中 (剩 %.0fs) -> 跳过"
                      % (self._heal_bail_t - now))
             return False
         won = int(getattr(self, "battles_won", 0))
@@ -308,19 +330,19 @@ class HealMixin:
         if res["ok"]:
             self._heal_ok_n += 1
             self._heal_streak = 0
-            self.log("[补血] %s 成功: %d 个键 (%.2fs, 补esc %d 次)"
+            self.log("[存盘] %s 成功: %d 个键 (%.2fs, 补esc %d 次)"
                      % (why, len(res["sent"]), res["elapsed"], res["esc_extra"]))
         else:
             self._heal_fail_n += 1
             self._heal_streak += 1
             self._heal_bail_t = time.time() + BAIL_CD
-            self.log("[补血] %s 失败: %s (已发 %d 个键: %s) -> 冷却 %.0fs"
+            self.log("[存盘] %s 失败: %s (已发 %d 个键: %s) -> 冷却 %.0fs"
                      % (why, res["reason"], len(res["sent"]),
                         " ".join(res["sent"]) or "无", BAIL_CD))
             self._heal_fail_shot(res)
             if self._heal_streak >= FAIL_LIMIT:
                 self._heal_off = True
-                self.log("[补血] 连续失败 %d 次 -> 本次运行内停用补血 "
+                self.log("[存盘] 连续失败 %d 次 -> 本次运行内停用存盘 "
                          "(可在 GUI 关掉/改序列后重启)"
                          % self._heal_streak)
         return bool(res["ok"])
@@ -358,7 +380,7 @@ class HealMixin:
                 len(res.get("sent") or []),
                 "open" if res.get("opened") else "noopen"))
             Image.fromarray(fr.astype("uint8")).save(fn)
-            self.log("[补血] 失败现场已存图: %s (按完停在哪一页, 校准序列用)"
+            self.log("[存盘] 失败现场已存图: %s (按完停在哪一页, 校准序列用)"
                      % os.path.basename(fn))
         except Exception:
             pass

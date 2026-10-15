@@ -7,6 +7,8 @@
   ③ WORD.DAT 名称表: 合成记录解析 + 真机文件 (存在才测) + 傀儡虫 ID 双重确认
   ④ ItemReader 逻辑: 注入假字节流验证 entries/amount/失败重开语义
   ⑤ tools/item_scan.py 与 bot_itemmon 的地址必须一致 (防止只改一处)
+  ⑥ 游戏窗口判据 is_game_title: 真机游戏标题命中 / 自家 GUI 标题被排除
+     (含「万一 GUI 标题混进 'Pal'」的兜底, 2026-10-12 加)
 
 真机标定记录 (2026-10-02, 勿凭推算改动):
   - rgInventory = viewport + 0x340: 布局推算 + dump 实测 104 条目全合理
@@ -274,6 +276,29 @@ check("read: 缺升级表 -> 仍返回成员, next_exp=0",
       and rr.read()["members"][0]["next_exp"] == 0)
 rr._rd = lambda addr, size=None: None
 check("read: 读失败 -> None", rr.read() is None)
+
+print("=" * 66)
+print("第 6 节: 游戏窗口判据 is_game_title (2026-10-12)")
+print("=" * 66)
+# 为什么要测: 机器人 / GUI 是靠「窗口标题含 'Pal'」找到游戏的 (游戏真标题实测 =
+#   `Pal Win95 [v3.0.2025.0616-dirty]`)。自家 GUI 标题里只有**全大写**的 "SDLPAL",
+#   所以以前 `"Pal" in 标题` 恰好为假 —— 纯属侥幸。GUI 标题一旦(v19.x 加版本号那样)
+#   混进大小写敏感的 "Pal", 就会被当成游戏窗口去读内存。这里把排除钉死。
+# 真机实测标题 (2026-10-12 EnumWindows 抓的, 尾部有空格照抄):
+GAME_TITLE = "Pal Win95 [v3.0.2025.0616-dirty] "
+check("真机游戏标题 -> 判为游戏窗口", IM.is_game_title(GAME_TITLE), GAME_TITLE)
+check("自家 GUI 标题 (带版本号) -> 不判为游戏窗口",
+      not IM.is_game_title("仙剑98 挂机机器人 (SDLPAL) v0.1.0-beta"))
+check("自家 GUI 标题 (旧版, 不带版本号) -> 不判为游戏窗口",
+      not IM.is_game_title("仙剑98 挂机机器人 (SDLPAL)"))
+check("★ GUI 标题里就算真混进 'Pal' 也被排除 (以前只靠大小写侥幸)",
+      not IM.is_game_title("仙剑98 挂机机器人 (Pal98) — v0.1.0-beta"),
+      "含 'Pal' 但含「挂机机器人」-> 必须为假")
+check("实测过的其它含 pal 的窗口 (MINGW64/bash) -> 不算游戏",
+      not IM.is_game_title("MINGW64:/d/Fang/Game/PAL_98/_bot/pal98-bot"))
+check("空标题 -> 不算游戏", not IM.is_game_title(""))
+check("大小写敏感: 全大写 'PAL' 不算 (真机游戏标题是 'Pal Win95')",
+      not IM.is_game_title("PAL98 emulator"))
 
 print()
 print("=" * 66)

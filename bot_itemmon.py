@@ -5,8 +5,8 @@
 缩小 —— 见 bot_gui.py 头部说明), 所以这里用 ctypes 自带一份最小读取实现。
 
 数据来源 (2026-10-02 真机标定, 全部只读):
-  - 游戏进程 = 标题含 "Pal" 的窗口 (自家 GUI 标题是 "仙剑98 挂机机器人 (SDLPAL)",
-    不含 "Pal", 不会误匹配)
+  - 游戏进程 = 标题含 "Pal" 的窗口 (游戏真标题 = `Pal Win95 [v3.0.2025.0616-dirty]`;
+    自家 GUI 标题含 "挂机机器人", find_pid 里显式排除, 见那个函数的说明)
   - sdlpal GLOBALVARS: viewport @0x00C3C8FC (pal_bot_mem.py 同源锚点)
   - rgInventory = viewport + 0x340 = 0x00C3CC3C
     (源码布局算出; tools/item_scan.py dump 实测 104 条目 ID/数量全部合理)
@@ -69,6 +69,16 @@ ROLES_HP_ADDR = ROLES_NAME_ADDR + 0x3C        # rgwHP[6]     0x00C3AB38
 EXP_ADDR = VIEWPORT_ADDR + 0x80               # Exp.rgPrimaryExp[6] 0x00C3C97C
 EXP_STRIDE = 8                                # EXPERIENCE = {wExp,wRes,wLevel,wCount}
 EXP_LEVEL_OFF = 4                             # 组内 wLevel 偏移 (校验用)
+MONEY_ADDR = EXP_ADDR - 4                     # gpGlobals->dwCash 0x00C3C978
+#   ★ 金钱标定 (2026-10-13, 三重证据, tools/_diag/probe_money2.py 可复现):
+#     ① SDLPAL 源码 global.h: GLOBALVARS 里 dwCash 定义在 wNumScene 之后、
+#        Exp(ALLEXPERIENCE) 之前; 与实测的 rgParty(+0x0C)/wPartyDirection(+0x5C)/
+#        wNumScene(+0x5E)/Exp(+0x80) 联立, dwCash 恰好 = viewport+0x7C (本地址);
+#     ② 差分实测: 挂机中 30s×3 帧采样, 该 DWORD 与三人经验**同一时刻** +120
+#        (战斗结算同步写入); 其余变化的地址全是 8B 步长的经验数组成员;
+#     ③ 量级交叉验证: 值 636773 ÷ 累计胜场 6749 ≈ 94 文/场, 正是 PAL 敌人的
+#        给钱区间 (普通小怪几十~一百多文)。
+#     与 EXP_ADDR 连续 (dwCash 4B + rgPrimaryExp 48B), 机器人一次读 52B。
 LEVELUPEXP_ADDR = VIEWPORT_ADDR - 0x1A24      # rgLevelUpExp[100] 0x00C3AED8
 PARTY_N_ADDR = VIEWPORT_ADDR + 0x0A           # wMaxPartyMemberIndex
 PARTY_ADDR = VIEWPORT_ADDR + 0x0C             # rgParty[6], 步长 10B
@@ -95,8 +105,23 @@ def parse_inventory(raw):
     return out
 
 
+def is_game_title(title):
+    """窗口标题是不是游戏窗口 —— 「含 'Pal' 且不是自家 GUI」。
+
+    ★ 2026-10-12: 显式排除自家 GUI (标题含 "挂机机器人")。以前只靠**大小写**
+      侥幸不撞车: 游戏真标题 = `Pal Win95 [v3.0.2025.0616-dirty]`, 而 GUI 标题里
+      只有全大写的 "SDLPAL" -> `"Pal" in 标题` 恰好为假。GUI 标题一旦改成含
+      "Pal" (见 botcfg.APP_VERSION 的告警), 这里就会把 GUI 当成游戏去读内存。
+
+    抽成纯函数是为了能测 (ctypes 回调没法单独测); 机器人侧同样的判据内联在
+    `pal_bot_mem.find_pal_pid` / `pal_bot_mem5._game_pids` 里 (那两处刻意不
+    引本模块, 保持 GUI 侧零耦合)。
+    """
+    return "Pal" in title and "挂机机器人" not in title
+
+
 def find_pid():
-    """标题含 "Pal" 的窗口所属进程 pid 列表 (升序去重)。"""
+    """标题含 "Pal" 的窗口所属进程 pid 列表 (升序去重); 判据见 is_game_title。"""
     res = []
 
     @ctypes.WINFUNCTYPE(ctypes.c_bool, wt.HWND, wt.LPARAM)
@@ -107,7 +132,7 @@ def find_pid():
         if n:
             b = ctypes.create_unicode_buffer(n + 1)
             u32.GetWindowTextW(hwnd, b, n + 1)
-            if "Pal" in b.value:
+            if is_game_title(b.value):
                 res.append(pid.value)
         return True
     u32.EnumWindows(cb, 0)

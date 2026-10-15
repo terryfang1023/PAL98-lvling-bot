@@ -13,8 +13,13 @@ v15 渐进巡逻);
 「战斗攻击键」= 战斗中 bot 反复按的那个键, 换地图/换版本后按键变了就在
 这里改 (落盘到 bot_config.json, 下次打开还在)。SDLPAL 官方键表见
 botcfg.ATTACK_KEY_CHOICES 上方注释。
+
+版本号 (2026-10-12): 窗口标题与底部状态区右下角都显示 botcfg.APP_VERSION,
+只有那一处定义 (对外发布号, 与 README/git tag 同源)。
+⚠️ 改标题时**不许出现 "Pal"**(大小写敏感) —— 那是找游戏窗口的判据。
 """
 import os
+import ctypes
 import re
 import sys
 import time
@@ -28,6 +33,7 @@ import botcfg
 import bot_itemmon                     # 只读物品栏 (独立 ctypes 实现, 不引用机器人内存引擎)
 import bot_chestlog                    # 开箱台账 chest_log.json (独立, 不引用机器人内存引擎)
 import bot_winlog                      # 累计总胜场 win_total.json (独立)
+import bot_explog                      # 战斗收益 exp_log.json (独立, 只读)
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 
@@ -38,10 +44,30 @@ STOP_FLAG = os.path.join(BASE, "mem_stop.flag")
 
 BIAS_CHOICES = ["", "上", "下", "左", "右", "右上", "右下", "左上", "左下"]
 
+# 程序图标 (任务栏 / Alt+Tab / 标题栏)。设计: 仙剑 + 右下循环箭头(挂机),
+# 底色取游戏本体的砖红/深棕面板色。生成器: tools/make_icon.py (每尺寸原生绘制)。
+ICON_PATH = os.path.join(BASE, "assets", "pal98bot.ico")
+
+# 显式应用 ID (2026-10-13 真机教训): Win11 任务栏对没有 AUMID 的窗口,
+# 图标解析会退化成"白纸"—— 即使 WM_SETICON 已把图标挂上。必须在 tk.Tk()
+# **之前**调用 SetCurrentProcessExplicitAppUserModelID 才生效 (见 _set_aumid)。
+APP_AUMID = "TerryFang.PAL98Bot.GUI"
+
+
+def _set_aumid():
+    """注册显式 AppUserModelID。幂等、失败静默 (老系统可能没这 API)。"""
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_AUMID)
+    except Exception:
+        pass
+
+
+_set_aumid()   # 模块加载即注册 (必须在任何 tk.Tk() 之前, import 时机天然满足)
+
 # 攻击键下拉的候选项 (语义见 botcfg.ATTACK_KEY_CHOICES 上方的官方键表注释)
 ATK_CHOICES = botcfg.ATTACK_KEY_CHOICES
-ATK_HINT = ("r=重复上次行动 (挂机首选)  a=自动战斗  f=法术  "
-            "space/enter=确认  d=防御  q=逃跑  e=物品  w=掷物  s=状态")
+ATK_HINT = ("r=重复行动 (挂机首选)  a=自动  f=法术  space=确认  "
+            "d=防御  q=逃跑  e=物品")
 
 # 子进程 (bot/体检) 强制 UTF-8 输出, 否则 Windows 管道默认 GBK -> 界面乱码
 ENV_UTF8 = dict(os.environ, PYTHONIOENCODING="utf-8")
@@ -51,8 +77,18 @@ class BotGUI:
 
     def __init__(self, root: tk.Tk):
         self.root = root
-        root.title("仙剑98 挂机机器人 (SDLPAL)")
-        root.minsize(860, 560)
+        # ★ 标题带版本号 (口径与告警见 botcfg.APP_VERSION):
+        #   任务栏 / Alt+Tab 一眼能看出跑的是哪一版 —— 尤其刚改完要确认新版有没有
+        #   真生效时。⚠️ 不许往标题里塞 "Pal" (大小写敏感), 会被机器人当成游戏窗口。
+        root.title("仙剑98 挂机机器人 (SDLPAL) %s" % botcfg.APP_VERSION)
+        # ★ 2026-10-13: 窗口比例收敛到 4:3 (原来按钮一条 + 参数一行塞满, 把窗口
+        #   撑到 ≈1400×890 = 1.57)。960/720 = 1.333; 实测控件"请求高度" 719,
+        #   所以 720 高刚好不裁切 (改布局后请用 _diag/measure_gui.py 复核)。
+        root.geometry("960x720")
+        root.minsize(900, 675)
+        # 任务栏/标题栏图标 (2026-10-13): 一眼认出哪个是机器人, 不再是
+        # tkinter 默认的灰羽毛。
+        self._apply_icon(root)
 
         self.proc = None                 # bot 子进程
         self.q = queue.Queue()           # 子进程日志队列
@@ -73,6 +109,63 @@ class BotGUI:
         root.after(1800, self._item_tick)   # 物品栏轮询 (主线程, 读 1.5KB 内存微秒级)
 
     # ---------- 界面 ----------
+    @staticmethod
+    def _apply_icon(root, path=None):
+        """设置窗口/任务栏图标。
+
+        - `default=` 让**之后创建的子窗口**(开箱记录等)继承同一图标;
+        - 文件缺失 (别人只拷了 .py 没拷 assets/) / 平台不支持 -> 静默跳过,
+          界面照样能开 —— 图标是锦上添花, 绝不能因为它起不来;
+        - 非 Windows 走 iconphoto (PhotoImage 必须留引用, 否则被 GC 回收
+          图标变空白 —— tkinter 的经典坑)。
+        """
+        path = path or ICON_PATH
+        try:
+            if not os.path.exists(path):
+                return
+            if sys.platform.startswith("win"):
+                root.iconbitmap(default=path)      # 类图标 (子窗口继承)
+                self._win_taskbar_icon(root, path)  # ★ 任务栏直达 (见下)
+            else:
+                img = tk.PhotoImage(file=os.path.splitext(path)[0] + ".png")
+                root.iconphoto(True, img)
+                root._icon_img = img
+        except Exception:
+            pass
+
+    @staticmethod
+    def _win_taskbar_icon(root, path=None):
+        """★ 任务栏图标 = AUMID (见 _set_aumid) + WM_SETICON 直达窗口。
+
+        真机取证 (2026-10-13): 只 `wm iconbitmap -default` 标题栏有图标但任务栏
+        仍是"白纸"; 补上 WM_SETICON 也还不够, 必须再加显式 AUMID (在建窗前注册)
+        任务栏才肯用窗口图标。这里用 ctypes 发三种 ICON_* (small/big/small2,
+        Win11 任务栏读 small2), LoadImageW/SendMessageW 显式声明 argtypes ——
+        64 位下句柄参数不声明类型会被截断。零前台切换。
+        """
+        path = path or ICON_PATH
+        try:
+            if not os.path.exists(path):
+                return
+            u32 = ctypes.windll.user32
+            u32.LoadImageW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p,
+                                       ctypes.c_uint, ctypes.c_int,
+                                       ctypes.c_int, ctypes.c_uint]
+            u32.LoadImageW.restype = ctypes.c_void_p       # HICON
+            u32.SendMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint,
+                                         ctypes.c_size_t, ctypes.c_ssize_t]
+            u32.SendMessageW.restype = ctypes.c_ssize_t
+            hwnd = u32.GetParent(root.winfo_id())  # Tk 内部子窗 -> 外层 toplevel
+            if not hwnd:
+                return
+            big = u32.LoadImageW(None, path, 1, 32, 32, 0x10)   # IMAGE_ICON
+            small = u32.LoadImageW(None, path, 1, 16, 16, 0x10)
+            for wparam, h in ((1, big), (0, small), (2, small)):
+                if h:
+                    u32.SendMessageW(hwnd, 0x80, wparam, h)  # WM_SETICON
+        except Exception:
+            pass  # 图标是锦上添花, 绝不因它起不来
+
     @staticmethod
     def _atk_from_cfg():
         """读配置里的攻击键; 值非法/文件损坏 -> 回退默认 (界面不许开不起来)。"""
@@ -133,35 +226,45 @@ class BotGUI:
         self._chest_dlg = None                     # 「开箱记录」窗口 (避免重复开)
         self._item_prev_focus = None          # 傀儡虫上次数量 (变化 -> 日志)
 
-        r1 = ttk.Frame(f); r1.pack(fill="x", pady=4)
-        self.v_maxb = entry(r1, "胜场上限 (0=不限)", 8, "0")
-        self.v_mins = entry(r1, "运行时长/分钟 (0=不限)", 10, "0")
-        self.v_r0 = entry(r1, "巡逻半径起", 6, "28")
-        self.v_rmax = entry(r1, "巡逻半径上限", 6, "90")
-        self.v_stall = entry(r1, "无胜场保险/分钟 (0=关)", 10, "20")
+        # ---- 参数行 (2026-10-13 重排) ----
+        # 原则: 一行最多 3 组 / 一行别超过 ~640px —— 原来"能塞就塞"的排法把窗口
+        # 撑到 1400+ 宽 (≈2:1), 现在改成多行窄条, 整窗收敛到 ≈4:3。
+        r1 = ttk.Frame(f); r1.pack(fill="x", pady=(2, 3))
+        self.v_maxb = entry(r1, "胜场上限 (0=不限)", 6, "0")
+        self.v_mins = entry(r1, "运行时长/分钟 (0=不限)", 6, "0")
+        self.v_stall = entry(r1, "无胜场保险/分钟 (0=关)", 6, "20")
 
-        r2 = ttk.Frame(f); r2.pack(fill="x", pady=(0, 2))
-        ttk.Label(r2, text="方向偏置 (优先往该方向探索)").pack(
-            side="left", padx=(10, 2))
+        r1b = ttk.Frame(f); r1b.pack(fill="x", pady=(0, 2))
+        self.v_r0 = entry(r1b, "巡逻半径起", 5, "28")
+        self.v_rmax = entry(r1b, "巡逻半径上限", 5, "90")
+        ttk.Label(r1b, text="方向偏置").pack(side="left", padx=(10, 2))
         self.v_bias = tk.StringVar(value="")
-        cb = ttk.Combobox(r2, textvariable=self.v_bias, width=8,
-                          values=BIAS_CHOICES, state="readonly")
-        cb.pack(side="left")
+        ttk.Combobox(r1b, textvariable=self.v_bias, width=7,
+                     values=BIAS_CHOICES, state="readonly").pack(side="left")
         self.v_open = tk.BooleanVar(value=False)
-        ttk.Checkbutton(r2, text="穿门模式 (不避开传送阵/楼梯, 踩到就去下一层)",
-                        variable=self.v_open).pack(side="left", padx=(16, 0))
-        self.v_elem = tk.BooleanVar(value=True)
-        ttk.Checkbutton(r2, text="要素巡回 (直奔怪点刷怪 + 顺路开宝箱)",
-                        variable=self.v_elem).pack(side="left", padx=(16, 0))
+        ttk.Checkbutton(r1b, text="穿门模式 (踩到传送阵/楼梯就去下一层)",
+                        variable=self.v_open).pack(side="left", padx=(14, 0))
 
-        r2b = ttk.Frame(f); r2b.pack(fill="x", pady=(0, 6))
-        self.v_auto = tk.BooleanVar(value=True)
-        ttk.Checkbutton(r2b, text="自动换场景 (刷不动就穿门去下一层, 按场景评分决定)",
-                        variable=self.v_auto).pack(side="left", padx=(10, 0))
-        ttk.Label(r2b, text="← 先点「场景评分」生成评分表, 效果最好",
+        r1c = ttk.Frame(f); r1c.pack(fill="x", pady=(0, 2))
+        ttk.Label(r1c, text="战斗攻击键").pack(side="left", padx=(10, 2))
+        self.v_atk = tk.StringVar(value=self._atk_from_cfg())
+        ttk.Combobox(r1c, textvariable=self.v_atk, width=7,
+                     values=ATK_CHOICES).pack(side="left")
+        ttk.Label(r1c, text="← " + ATK_HINT,
                   foreground="#666").pack(side="left", padx=(8, 0))
 
-        r2b2 = ttk.Frame(f); r2b2.pack(fill="x", pady=(0, 6))
+        # ---- 勾选项 (每行 2~3 个, 长的说明保留在括号里) ----
+        r2 = ttk.Frame(f); r2.pack(fill="x", pady=(0, 2))
+        self.v_elem = tk.BooleanVar(value=True)
+        ttk.Checkbutton(r2, text="要素巡回 (直奔怪点刷怪 + 顺路开宝箱)",
+                        variable=self.v_elem).pack(side="left", padx=(10, 0))
+        self.v_auto = tk.BooleanVar(value=True)
+        ttk.Checkbutton(r2, text="自动换场景", variable=self.v_auto).pack(
+            side="left", padx=(14, 0))
+        ttk.Label(r2, text="← 先点「场景评分」效果最好",
+                  foreground="#666").pack(side="left", padx=(6, 0))
+
+        r2b2 = ttk.Frame(f); r2b2.pack(fill="x", pady=(0, 2))
         self.v_rope = tk.BooleanVar(value=botcfg.as_bool(
             botcfg.get("rope"), True))
         ttk.Checkbutton(r2b2, text="绳子攀爬 (走上绳子按空格换层 —— 试炼窟等)",
@@ -169,116 +272,154 @@ class BotGUI:
         self.v_rhunt = tk.BooleanVar(value=botcfg.as_bool(
             botcfg.get("rope_hunt"), True))
         ttk.Checkbutton(r2b2, text="遇到就爬 (绳子优先级最高)",
-                        variable=self.v_rhunt).pack(side="left", padx=(16, 0))
+                        variable=self.v_rhunt).pack(side="left", padx=(14, 0))
+
+        r2b3 = ttk.Frame(f); r2b3.pack(fill="x", pady=(0, 2))
         self.v_cmemo = tk.BooleanVar(value=botcfg.as_bool(
             botcfg.get("chest_memo"), True))
-        ttk.Checkbutton(r2b2, text="记住开过的箱子 (写台账, 跨重启跳过不重复开)",
-                        variable=self.v_cmemo).pack(side="left", padx=(16, 0))
+        ttk.Checkbutton(r2b3, text="记住开过的箱子 (跨重启跳过)",
+                        variable=self.v_cmemo).pack(side="left", padx=(10, 0))
         self.v_cmem = tk.BooleanVar(value=botcfg.as_bool(
             botcfg.get("chest_mem"), True))
-        ttk.Checkbutton(r2b2, text="空箱读内存跳过 (已开空/不可触发的直接忽略)",
-                        variable=self.v_cmem).pack(side="left", padx=(16, 0))
+        ttk.Checkbutton(r2b3, text="空箱读内存跳过 (已开空/不可触发的直接忽略)",
+                        variable=self.v_cmem).pack(side="left", padx=(14, 0))
+
+        r2b4 = ttk.Frame(f); r2b4.pack(fill="x", pady=(0, 2))
         self.v_feat = tk.BooleanVar(value=botcfg.as_bool(
             botcfg.get("feat_log"), True))
-        ttk.Checkbutton(r2b2, text="要素台账 (按编号记每次战斗, 可查哪些怪点没打过)",
-                        variable=self.v_feat).pack(side="left", padx=(16, 0))
-
+        ttk.Checkbutton(r2b4, text="要素台账 (按编号记每次战斗)",
+                        variable=self.v_feat).pack(side="left", padx=(10, 0))
         # ---- 走没走过的路 (2026-10-04) ----
-        r2b3 = ttk.Frame(f); r2b3.pack(fill="x", pady=(0, 6))
         self.v_fresh = tk.BooleanVar(value=(
             botcfg.as_float(botcfg.get("revisit_lambda"), 0.15) > 0))
-        ttk.Checkbutton(r2b3, text="优先走没走过的路 (寻路避重 + 怪点轮转)",
-                        variable=self.v_fresh).pack(side="left", padx=(10, 0))
+        ttk.Checkbutton(r2b4, text="优先走没走过的路 (寻路避重 + 怪点轮转)",
+                        variable=self.v_fresh).pack(side="left", padx=(14, 0))
+
+        r2b5 = ttk.Frame(f); r2b5.pack(fill="x", pady=(0, 2))
         self.v_explore = tk.BooleanVar(value=botcfg.as_bool(
             botcfg.get("explore"), True))
-        ttk.Checkbutton(r2b3, text="每", variable=self.v_explore).pack(
-            side="left", padx=(16, 1))
+        ttk.Checkbutton(r2b5, text="每", variable=self.v_explore).pack(
+            side="left", padx=(10, 1))
         self.v_explore_every = tk.StringVar(
             value=str(botcfg.get("explore_every")))
-        ttk.Entry(r2b3, textvariable=self.v_explore_every, width=3).pack(
+        ttk.Entry(r2b5, textvariable=self.v_explore_every, width=3).pack(
             side="left")
-        ttk.Label(r2b3, text="场去一次没走过的区域",
+        ttk.Label(r2b5, text="场去一次没走过的区域 (探索配额)",
                   foreground="#666").pack(side="left", padx=(1, 0))
 
-        r2c = ttk.Frame(f); r2c.pack(fill="x", pady=(0, 6))
-        ttk.Label(r2c, text="战斗攻击键").pack(side="left", padx=(10, 2))
-        self.v_atk = tk.StringVar(value=self._atk_from_cfg())
-        ttk.Combobox(r2c, textvariable=self.v_atk, width=8,
-                     values=ATK_CHOICES).pack(side="left")
-        ttk.Label(r2c, text="← " + ATK_HINT,
-                  foreground="#666").pack(side="left", padx=(8, 0))
-
-        # ---- 战后自动补血 (pal_bot_heal.py 的菜单宏) ----
-        r2d = ttk.Frame(f); r2d.pack(fill="x", pady=(0, 6))
+        # ---- 自动存盘 (pal_bot_heal.py 的菜单宏; 内部标识沿用 heal_* 历史名,
+        #      2026-10-13 用户把这项功能从"补血"改成"存盘" —— 引擎本来就是
+        #      "跑一条菜单按键序列 + 四道校验", 换功能只换序列和文案) ----
+        r2d = ttk.Frame(f); r2d.pack(fill="x", pady=(0, 2))
         self.v_heal = tk.BooleanVar(value=bool(
             botcfg.as_bool(botcfg.get("heal_after_battle"), True)))
-        ttk.Checkbutton(r2d, text="战后自动补血", variable=self.v_heal).pack(
+        ttk.Checkbutton(r2d, text="战后自动存盘", variable=self.v_heal).pack(
             side="left", padx=(10, 0))
         ttk.Label(r2d, text="每").pack(side="left", padx=(14, 1))
         self.v_heal_every = tk.StringVar(value=str(botcfg.get("heal_every")))
         ttk.Entry(r2d, textvariable=self.v_heal_every, width=3).pack(
             side="left")
-        ttk.Label(r2d, text="场一次   按键序列").pack(side="left", padx=(1, 2))
-        self.v_heal_seq = tk.StringVar(value=str(
-            botcfg.get("heal_seq") or botcfg.SEQ_DEFAULT))
-        ttk.Entry(r2d, textvariable=self.v_heal_seq, width=44).pack(
-            side="left")
-        ttk.Label(r2d, text="间隔").pack(side="left", padx=(8, 1))
+        ttk.Label(r2d, text="场一次   间隔").pack(side="left", padx=(1, 2))
         self.v_heal_gap = tk.StringVar(value=str(botcfg.get("heal_gap")))
         ttk.Entry(r2d, textvariable=self.v_heal_gap, width=4).pack(
             side="left")
         ttk.Label(r2d, text="s").pack(side="left")
-        r2e = ttk.Frame(f); r2e.pack(fill="x", pady=(0, 6))
-        ttk.Label(r2e, text="← 序列默认是 ESC开菜单(光标在仙术)→回车选巫后→"
-                            "右→回车→回车→右→回车→ESC；"
-                            "序列不对点「补血测试」一步步校准",
-                  foreground="#666").pack(side="left", padx=(10, 0))
 
-        r3 = ttk.Frame(f); r3.pack(fill="x", pady=(0, 6))
-        self.v_exe = entry(r3, "Python 解释器 (bot 子进程使用)", 46,
+        r2e = ttk.Frame(f); r2e.pack(fill="x", pady=(0, 2))
+        ttk.Label(r2e, text="按键序列").pack(side="left", padx=(10, 2))
+        self.v_heal_seq = tk.StringVar(value=str(
+            botcfg.get("heal_seq") or botcfg.SEQ_DEFAULT))
+        ttk.Entry(r2e, textvariable=self.v_heal_seq, width=31).pack(
+            side="left")
+
+        r2f = ttk.Frame(f); r2f.pack(fill="x", pady=(0, 3))
+        ttk.Label(r2f, text="← 存档: ESC→系统→存档→选档位 (存完自动回地图)；"
+                            "⚠ 退出/读档是危险项, 先「存盘测试」验一遍",
+                  foreground="#b06000").pack(side="left", padx=(10, 0))
+
+        r3 = ttk.Frame(f); r3.pack(fill="x", pady=(0, 4))
+        self.v_exe = entry(r3, "Python 解释器 (bot 子进程使用)", 33,
                            sys.executable)
-        ttk.Label(r3, text="").pack(side="left")
 
     def _build_buttons(self):
+        """操作按钮 —— 2026-10-13 拆成两行。
+
+        原来 14 个按钮挤在一行, 单这一条就把窗口撑到 1300+ 宽 (整窗 ≈2:1);
+        拆两行后按钮区 ≈700px, 整窗收敛到 ≈4:3。顺序按"用得多 -> 用得少"。
+        """
         f = ttk.Frame(self.root)
         f.pack(fill="x", padx=10, pady=4)
-        self.b_start = ttk.Button(f, text="▶ 开始", command=self.start)
+        row1 = ttk.Frame(f); row1.pack(fill="x", pady=(0, 3))
+        row2 = ttk.Frame(f); row2.pack(fill="x")
+        self.b_start = ttk.Button(row1, text="▶ 开始", command=self.start)
         self.b_start.pack(side="left", padx=(0, 6))
-        self.b_stop = ttk.Button(f, text="■ 停止 (优雅)", command=self.stop,
+        self.b_stop = ttk.Button(row1, text="■ 停止 (优雅)", command=self.stop,
                                  state="disabled")
         self.b_stop.pack(side="left", padx=6)
-        self.b_kill = ttk.Button(f, text="⛔ 强制停止", command=self.force_stop,
+        self.b_kill = ttk.Button(row1, text="⛔ 强制停止", command=self.force_stop,
                                  state="disabled")
         self.b_kill.pack(side="left", padx=6)
-        ttk.Button(f, text="场景体检", command=self.scene_check).pack(
+        ttk.Button(row1, text="场景体检", command=self.scene_check).pack(
             side="left", padx=6)
-        ttk.Button(f, text="场景评分", command=self.scene_score).pack(
+        ttk.Button(row1, text="场景评分", command=self.scene_score).pack(
             side="left", padx=6)
-        ttk.Button(f, text="环境体检", command=self.env_check).pack(
+        ttk.Button(row1, text="环境体检", command=self.env_check).pack(
             side="left", padx=6)
-        ttk.Button(f, text="效率报告", command=self.run_report).pack(
+        ttk.Button(row1, text="效率报告", command=self.run_report).pack(
             side="left", padx=6)
-        ttk.Button(f, text="门审计", command=self.door_audit).pack(
-            side="left", padx=6)
-        ttk.Button(f, text="战斗识别", command=self.battle_probe).pack(
-            side="left", padx=6)
-        ttk.Button(f, text="空箱体检", command=self.chest_probe).pack(
-            side="left", padx=6)
-        ttk.Button(f, text="补血测试", command=self.heal_once).pack(
-            side="left", padx=6)
-        ttk.Button(f, text="刷新怪点/宝箱", command=self.refresh_scene_info).pack(
-            side="left", padx=6)
-        ttk.Button(f, text="开箱记录", command=self.chest_log_view).pack(
-            side="left", padx=6)
-        ttk.Button(f, text="检测游戏窗口", command=self.detect_window).pack(
-            side="left", padx=6)
-        ttk.Button(f, text="清空日志", command=self.clear_log).pack(
+        ttk.Button(row1, text="清空日志", command=self.clear_log).pack(
             side="right", padx=6)
+        ttk.Button(row2, text="门审计", command=self.door_audit).pack(
+            side="left", padx=6)
+        ttk.Button(row2, text="战斗识别", command=self.battle_probe).pack(
+            side="left", padx=6)
+        ttk.Button(row2, text="空箱体检", command=self.chest_probe).pack(
+            side="left", padx=6)
+        ttk.Button(row2, text="存盘测试", command=self.heal_once).pack(
+            side="left", padx=6)
+        ttk.Button(row2, text="刷新怪点/宝箱",
+                   command=self.refresh_scene_info).pack(side="left", padx=6)
+        ttk.Button(row2, text="开箱记录", command=self.chest_log_view).pack(
+            side="left", padx=6)
+        ttk.Button(row2, text="检测游戏窗口", command=self.detect_window).pack(
+            side="left", padx=6)
 
     def _build_log(self):
         f = ttk.LabelFrame(self.root, text="运行日志")
         f.pack(fill="both", expand=True, padx=10, pady=4)
-        self.log = scrolledtext.ScrolledText(f, height=18, state="disabled",
+        body = ttk.Frame(f)
+        body.pack(fill="both", expand=True)
+        # ---- 左: 战斗收益 (2026-10-13 用户诉求) ----
+        #   数据来自 exp_log.json —— 机器人每赢一场写入 (唯一写者), 这里只读。
+        left = ttk.Frame(body)
+        left.pack(side="left", fill="y", padx=(0, 8))
+        ttk.Label(left, text="战斗收益 (本次运行)",
+                  font=("", 9, "bold")).pack(anchor="w")
+        self.v_gain_sum = tk.StringVar(value="经验 +0 / 金钱 +0")
+        ttk.Label(left, textvariable=self.v_gain_sum,
+                  font=("Consolas", 10, "bold")).pack(anchor="w")
+        self.v_gain_rate = tk.StringVar(value="平均 -- 经验/时")
+        ttk.Label(left, textvariable=self.v_gain_rate,
+                  foreground="#666666").pack(anchor="w")
+        cols = ("n", "t", "exp", "cash")
+        self.tree_gain = ttk.Treeview(left, columns=cols, show="headings",
+                                      height=6)
+        for c, w, txt, anc in (("n", 52, "场次", "e"), ("t", 60, "时间", "center"),
+                               ("exp", 62, "经验", "e"), ("cash", 56, "金钱", "e")):
+            self.tree_gain.heading(c, text=txt)
+            self.tree_gain.column(c, width=w, anchor=anc, stretch=False)
+        self.tree_gain.pack(fill="both", expand=True, pady=(4, 0))
+        ttk.Label(left, text="经验 = 每人所得 (三人在队各拿一份,\n"
+                             "不是三倍总和); 开箱收益只计入累计",
+                  foreground="#999999", font=("", 8),
+                  justify="left").pack(anchor="w", pady=(2, 0))
+        # ---- 右: 运行日志 (原有) ----
+        right = ttk.Frame(body)
+        right.pack(side="left", fill="both", expand=True)
+        # width 给个较小的请求值, 由 fill/expand 撑开 —— 否则默认 80 列会把
+        # 整窗撑得很宽 (2026-10-13 改 4:3 布局时收窄)。
+        self.log = scrolledtext.ScrolledText(right, height=11, width=58,
+                                             state="disabled",
                                              font=("Consolas", 9))
         self.log.pack(fill="both", expand=True)
 
@@ -305,6 +446,11 @@ class BotGUI:
             side="left", padx=(12, 0))
         ttk.Button(wf, text="要素覆盖率", command=self.feat_report).pack(
             side="left", padx=6)
+        # ★ 底部右侧固定显示版本号 (2026-10-12): 截图分享时也能带出版本,
+        #   免得"这张图是哪一版跑出来的"说不清。值只有一个来源 = botcfg.APP_VERSION。
+        self.v_ver = tk.StringVar(value="版本 %s" % botcfg.APP_VERSION)
+        ttk.Label(wf, textvariable=self.v_ver, anchor="e",
+                  foreground="#777777").pack(side="right", padx=(0, 2))
         self.v_status = tk.StringVar(value="已停止")
         ttk.Label(f, textvariable=self.v_status, anchor="w",
                   relief="sunken").pack(fill="x")
@@ -414,13 +560,13 @@ class BotGUI:
             botcfg.put("attack_key", atk)    # 记下来, 下次打开界面还在
         except Exception as ex:
             self.log_line("[GUI] 攻击键写盘失败 (不影响本次运行): %s" % ex)
-        # 补血选项: 序列语法必须先过 —— 序列错了机器人会在菜单里乱按
+        # 存盘选项: 序列语法必须先过 —— 序列错了机器人会在菜单里乱按
         heal_on = bool(self.v_heal.get())
         try:
             heal_keys = botcfg.parse_seq(self.v_heal_seq.get())
         except ValueError as ex:
-            self._err("补血序列错误", "「按键序列」%s\n\n"
-                      "写法示例: esc,回车,右,回车,esc 或 ESC → 回车 → 右 → ESC"
+            self._err("存盘序列错误", "「按键序列」%s\n\n"
+                      "写法示例: esc,下,下,回车,回车,回车 或 ESC → 下 → 回车"
                       % ex)
             return
         try:
@@ -447,7 +593,7 @@ class BotGUI:
             botcfg.put("heal_every", heal_every)
             botcfg.put("heal_gap", heal_gap)
         except Exception as ex:
-            self.log_line("[GUI] 补血设置写盘失败 (不影响本次运行): %s" % ex)
+            self.log_line("[GUI] 存盘设置写盘失败 (不影响本次运行): %s" % ex)
         secs = mins * 60
         args = [exe, "-u", "pal_bot_mem5.py", str(maxb), str(secs),
                 str(r0), str(rmax), self.v_bias.get(),
@@ -657,11 +803,13 @@ class BotGUI:
         self._run_bg([exe, script], "空箱体检")
 
     def heal_once(self):
-        """后台跑 tools/heal_once.py: 对当前画面**真的执行一次**补血宏。
+        """后台跑 tools/heal_once.py: 对当前画面**真的执行一次**存盘宏。
 
-        用途: 校准「按键序列」。机器人必须先停止 (两个进程抢键盘没法判断
+        用途: 校准「按键序列」—— 存盘/补血都是"按一串菜单键", 序列对不对
+        只有真按一遍才知道。机器人必须先停止 (两个进程抢键盘没法判断
         是谁按的); 脚本自己也会检测并在机器人还在跑时拒绝执行。
         序列沿用界面输入框里的当前值 (--seq 传过去, 不改配置文件)。
+        (函数名/脚本名沿用 heal 历史名, 内部标识不动; 界面文字已是「存盘」。)
         """
         script = os.path.join(BASE, "tools", "heal_once.py")
         if not os.path.exists(script):
@@ -671,9 +819,9 @@ class BotGUI:
         args = [exe, script]
         if self.v_heal_seq.get().strip():
             args += ["--seq", self.v_heal_seq.get().strip()]
-        self.log_line("[补血测试] 将对当前画面执行一次补血宏 (会按键盘!) — "
+        self.log_line("[存盘测试] 将对当前画面执行一次存盘宏 (会按键盘!) — "
                       "请确认机器人已停止、游戏画面停在地图上…")
-        self._run_bg(args, "补血测试")
+        self._run_bg(args, "存盘测试")
 
     def _run_bg(self, cmd, tag):
         """后台跑一个命令, 输出逐行灌进日志 (不卡界面)。"""
@@ -1063,6 +1211,7 @@ class BotGUI:
             except Exception:
                 pass
             self.v_wins_local.set(str(self.wins))
+            self._gain_refresh()          # 战斗收益左栏 (同样 1s 节流)
         # 状态栏
         if self._running():
             el = int(time.time() - self.t_start) if self.t_start else 0
@@ -1078,6 +1227,55 @@ class BotGUI:
                                  if self.cur_scene else "启动中",
                                  self.wins, self.wins_total, extra))
         self.root.after(250, self._poll)
+
+    def _gain_refresh(self):
+        """读 exp_log.json 刷新左栏战斗收益 (机器人唯一写者, 这里只读)。
+
+        文件缺失/损坏/机器人没跑 -> 保持原显示 (上次运行的台账仍有参考价值,
+        时间口径看「运行不足/时均」与场次号)。列表只在内容变化时重建, 防闪烁。
+        """
+        d = bot_explog.GainLog().load()
+        if not d:
+            return
+        if d.get("version") != bot_explog.VERSION:
+            # ★ 旧口径的台账是错的 (v1 六人求和 3 倍虚高; v2 基线被反复清零 ->
+            #   时均只有真值的 1/10)。机器人下次赢一场就会按新口径重写, 在那之前
+            #   宁可不显示, 免得用户又被旧数迷惑。
+            self.v_gain_sum.set("旧口径台账 v%s (机器人下次胜场后自动刷新)"
+                                % d.get("version"))
+            self.v_gain_rate.set("")
+            t = self.tree_gain
+            t.delete(*t.get_children())
+            self._gain_sig = None
+            return
+        de = d.get("d_exp") or 0
+        dc = d.get("d_cash") or 0
+        el = d.get("elapsed") or 0
+        bad = d.get("bad") or 0
+        msg = "经验 +%d (每人) / 金钱 +%d" % (de, dc)
+        if bad:
+            # ★ v3: 会话内被跳过(脏数据)的场次。正常情况下应该是 0;
+            #   持续变大说明读档/换 exe/内存读花, 时均会被低估, 值得看一眼。
+            msg += "  · 跳过 %d 场" % bad
+        self.v_gain_sum.set(msg)
+        if el >= 60:
+            self.v_gain_rate.set(
+                "平均 %s 经验/时 · %s 金钱/时"
+                % (format(bot_explog.rate_per_hour(de, el), ","),
+                   format(bot_explog.rate_per_hour(dc, el), ",")))
+        else:
+            self.v_gain_rate.set("运行不足 1 分钟, 暂无时均")
+        rows = d.get("battles") or []
+        sig = (d.get("wins"), de, dc, len(rows))
+        if sig == getattr(self, "_gain_sig", None):
+            return
+        self._gain_sig = sig
+        t = self.tree_gain
+        t.delete(*t.get_children())
+        for b in rows:
+            t.insert("", "end", values=(
+                "#%s" % b.get("n"), b.get("t"),
+                "+%s" % b.get("exp"), "+%s" % b.get("cash")))
 
     def _set_buttons(self, running):
         self.b_start.config(state="disabled" if running else "normal")

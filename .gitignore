@@ -28,12 +28,17 @@ win_reset.flag
 feat_report.txt
 feat_report.json
 
+# 跑出来的战斗收益台账 (v19.3) —— 同上, 机器人唯一写者, 每台机器不同
+exp_log.json
+
 # 诊断截图 (机器人自动留档的现场图, 不入库)
 *.png
 *.jpg
 
 # 但 README 用的配图要入库 (这一条必须排在 *.png 之后)
 !docs/images/*.png
+# 程序图标的 PNG 版 (ico 本就不被忽略; 生成器 tools/make_icon.py)
+!assets/*.png
 
 # Python
 __pycache__/

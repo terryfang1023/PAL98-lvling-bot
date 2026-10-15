@@ -296,7 +296,7 @@ _REAL_IS_BATTLE = PB.is_battle
 
 
 def t_settle_screen():
-    print("== v18.7 _settle_screen: 等淡入散场再让补血拍基准帧 ==")
+    print("== v18.7 _settle_screen: 等淡入散场再让存盘宏拍基准帧 ==")
     import numpy as np
     from pal_bot_heal import diff_frac as dfrac
     base = np.zeros((40, 60, 3), dtype=np.uint8)
@@ -353,9 +353,165 @@ def t_real_is_battle_untouched():
     check("pal_bot.is_battle 已恢复为原函数", PB.is_battle is _REAL_IS_BATTLE)
 
 
+def t_fight_watchdog():
+    print("== v19.1 卡死保护: 攻击键连发却无画面进展 -> esc 退回指令层 ==")
+    # 事故指纹 (2026-10-10 用户截图): 回车把指令菜单打成"选人/选目标",
+    # R(重复) 在该等待态**无效**, 画面静止但 is_battle 恒真 (底部 HP/MP
+    # 数字在) -> 旧代码一直按 R 到 180s 超时。按一下 esc 就能退回。
+    # 帧的 "move" 键: True=画面在动 (由 _frames_moved 打桩读取)。
+    o = shadow(
+        frames=[{"bt": False, "menu": False}] +         # 哨兵
+               [{"bt": True, "menu": False}] * 40,      # 卡在选人: 特征在, 画面静止
+        default={"bt": False, "menu": False})
+    _fill_fight(o)
+    o._battle_confirm = lambda: ("conf", 0.2)
+    o._frames_moved = lambda a, b: bool(b and b.get("move"))
+    o.FIGHT_STILL_LIMIT = -1.0            # 测试不等真实时间: 静止立刻触发
+    old_max = M4.BATTLE_MAX
+    M4.BATTLE_MAX = 60.0
+    try:
+        ok = o.fight(why="测试")
+    finally:
+        M4.BATTLE_MAX = old_max
+    check("流程走完返回 True", ok is True)
+    check("卡死保护按了 esc", o.g.keys.count("esc") >= 1, o.g.keys)
+    check("日志说明卡死原因", any("卡死保护" in m for m in o.logs),
+          o.logs[-3:])
+    check("攻击键仍在发 (esc 之后 R 恢复有效)", len(o.g.attacks) >= 1,
+          len(o.g.attacks))
+    check("胜场照常 +1", o.battles_won == 1)
+
+    # 对照组: 画面一直在动 (正常战斗) -> 绝不触发保护
+    o = shadow(
+        frames=[{"bt": False, "menu": False}] +
+               [{"bt": True, "menu": False, "move": True}] * 8,
+        default={"bt": False, "menu": False})
+    _fill_fight(o)
+    o._battle_confirm = lambda: ("conf", 0.2)
+    o._frames_moved = lambda a, b: bool(b and b.get("move"))
+    o.FIGHT_STILL_LIMIT = -1.0            # 再苛刻也只在"静止"时触发
+    old_max = M4.BATTLE_MAX
+    M4.BATTLE_MAX = 60.0
+    try:
+        ok = o.fight(why="测试")
+    finally:
+        M4.BATTLE_MAX = old_max
+    check("正常动画战斗 -> 返回 True", ok is True)
+    check("正常动画战斗 -> 一个 esc 都没有",
+          o.g.keys.count("esc") == 0, o.g.keys)
+    check("没有卡死保护日志",
+          not any("卡死保护" in m for m in o.logs))
+
+
+def t_fight_esc_escalation():
+    print("== v19.2 长战斗无进展兜底: R 连按 20 次 -> esc (不被待机动画骗过) ==")
+    # 2026-10-12 真机 14 帧实测: 选人等待态的角色待机动画让帧间差高达
+    # 6~13 万像素 (>> anim_min=300) -> v19.1 静止检测恒判"在动",
+    # 178 场 180s 超时只有 13 场被救回。所以必须按 R 次数/时长兜底。
+    o = shadow(
+        frames=[{"bt": False, "menu": False}] +                   # 哨兵
+               [{"bt": True, "menu": False, "move": True}] * 21,  # 动画不停
+        default={"bt": False, "menu": False})
+    _fill_fight(o)
+    o._battle_confirm = lambda: ("conf", 0.2)
+    o._frames_moved = lambda a, b: bool(b and b.get("move"))
+    # KEY_F_GAP 保持 0.5s 真实节奏: 第 21 次循环 n_f=20 (约 10s), 此时
+    # over-last_esc > ESC_EVERY(8s) 恰好开门 —— 与真机时序一致。
+    o.KEY_F_GAP = 0.5
+    old_max = M4.BATTLE_MAX
+    M4.BATTLE_MAX = 60.0
+    try:
+        ok = o.fight(why="测试")
+    finally:
+        M4.BATTLE_MAX = old_max
+    check("流程走完返回 True", ok is True)
+    check("R 连按 20 次后按了兜底 esc", o.g.keys.count("esc") >= 1, o.g.keys)
+    check("日志说明是次数兜底 (长战斗无进展)",
+          any("长战斗无进展" in m for m in o.logs), o.logs[-3:])
+    check("动画不停 -> v19.1 静止保护没抢着触发",
+          not any("卡死保护" in m for m in o.logs), o.logs[-3:])
+    check("兜底后攻击键仍在发", len(o.g.attacks) >= 18, len(o.g.attacks))
+    check("胜场照常 +1", o.battles_won == 1)
+
+    # 时间路径: R 次数不多但战斗超 LONG_BATTLE -> 也要 esc
+    o = shadow(
+        frames=[{"bt": False, "menu": False}] +
+               [{"bt": True, "menu": False, "move": True}] * 5,
+        default={"bt": False, "menu": False})
+    _fill_fight(o)
+    o._battle_confirm = lambda: ("conf", 0.2)
+    o._frames_moved = lambda a, b: bool(b and b.get("move"))
+    o.KEY_F_GAP = 0.0
+    o.LONG_BATTLE = -1.0                  # 测试不等真实时间: 立刻超时
+    o.ESC_EVERY = -1.0                    # 间隔门槛也放开
+    old_max = M4.BATTLE_MAX
+    M4.BATTLE_MAX = 60.0
+    try:
+        ok = o.fight(why="测试")
+    finally:
+        M4.BATTLE_MAX = old_max
+    check("超 LONG_BATTLE -> 返回 True", ok is True)
+    check("R 次数不多也按了兜底 esc (时间路径)",
+          o.g.keys.count("esc") >= 1, o.g.keys)
+    check("时间路径也有兜底日志",
+          any("长战斗无进展" in m for m in o.logs), o.logs[-3:])
+
+
+def t_settle_space_guard():
+    print("== v19.2 结算 space 复查: 落进新战斗 -> esc 撤销误确认 ==")
+    # 事故根源 (2026-10-12): 机器人从不按 enter, 但结算 space 与 enter 同为
+    # "确认" —— 新战斗淡入时 battle_screen 还认不出, space 落进去把指令菜单
+    # 打成"选人"等待态。按完复查一次, 真开打了立刻 esc 撤销。
+    # 正常: 结算期没有新战斗 -> 只按 space, 绝不多按 esc
+    o = shadow([{"bt": False, "menu": False}])
+    _fill_fight(o)
+    o._battle_confirm = lambda: ("conf", 0.2)
+    o.battle_screen = lambda: False
+    o.fight(why="测试")
+    check("无新战斗 -> space 2 次照常", o.g.keys.count("space") == 2, o.g.keys)
+    check("无新战斗 -> 不按 esc", o.g.keys.count("esc") == 0, o.g.keys)
+
+    # space 之后真的开打了 -> 立刻 esc 撤销
+    o = shadow([{"bt": False, "menu": False}])
+    _fill_fight(o)
+    o._battle_confirm = lambda: ("conf", 0.2)
+    calls = {"n": 0}
+
+    def bs():
+        calls["n"] += 1
+        return calls["n"] == 2            # 第 2 次调用 = space 之后的复查
+
+    o.battle_screen = bs
+    o.fight(why="测试")
+    check("space 落进新战斗 -> 检测到了", calls["n"] >= 2)
+    check("按了 esc 撤销误确认", o.g.keys.count("esc") == 1, o.g.keys)
+    check("日志说明撤销原因",
+          any("撤销误确认" in m for m in o.logs), o.logs[-3:])
+    check("space 只发了一次 (不再发第二个)", o.g.keys.count("space") == 1,
+          o.g.keys)
+
+
+def t_frames_moved_robust():
+    print("== _frames_moved: 真帧可判, 打桩帧/异常按'在动'处理 (fail-safe) ==")
+    import numpy as np
+    p = MemBot4.__new__(MemBot4)          # 裸影子: 只挂 _diffpix/px_thr
+    p.px_thr = lambda x: 5
+    a = np.zeros((12, 12, 3), np.uint8)
+    b = a.copy()
+    check("两帧全同 -> 没动", p._frames_moved(a, b) is False)
+    c = a.copy()
+    c[0:6, :] = 255                       # 一大块变化 -> 在动
+    check("大块变化 -> 在动", p._frames_moved(a, c) is True)
+    check("形状不一致 -> 按在动 (不触发保护)",
+          p._frames_moved(a, np.zeros((5, 5, 3), np.uint8)) is True)
+    check("dict 帧 (测试打桩) -> 按在动不炸",
+          p._frames_moved({"x": 1}, {"y": 2}) is True)
+    check("None 帧 -> 按在动不炸", p._frames_moved(None, a) is True)
+
+
 def main():
     print("=" * 62)
-    print("test_fight.py — fight 进场确认+主循环顺序 v18.5 回归")
+    print("test_fight.py — fight 进场确认+主循环顺序 v18.5/v19.1 回归")
     print("=" * 62)
     # 打桩 pal_bot.is_battle (帧字典模式), 结束后恢复
     _real = PB.is_battle
@@ -368,6 +524,10 @@ def main():
         t_fight_branches()
         t_fight_menu_attack_priority()
         t_fight_conf_full()
+        t_fight_watchdog()
+        t_fight_esc_escalation()
+        t_settle_space_guard()
+        t_frames_moved_robust()
         t_settle_screen()
     finally:
         PB.is_battle = _real
