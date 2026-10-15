@@ -42,7 +42,7 @@ CONFIG_PATH = os.path.join(BASE, "bot_config.json")
 #     几处 ctypes finder 补齐了同样的兜底 —— 见 pal_bot_mem.find_pal_pid /
 #     pal_bot_mem5._game_pids / bot_itemmon.is_game_title。但别去试探这条底线,
 #     标题保持全大写 "SDLPAL" 最省事。)
-APP_VERSION = "v0.1.0-beta"
+APP_VERSION = "v0.2.0-beta"
 
 # ----------------------------------------------------------------------
 # 战斗中反复按的那个键 (attack_key) 的候选值
