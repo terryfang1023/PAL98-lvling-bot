@@ -12,6 +12,11 @@ k32 = ctypes.windll.kernel32
 u32 = ctypes.windll.user32
 OPEN_OK = 0x0010 | 0x0400
 SCRIPT_TAB_ADDR = 0x00C3AAB8
+# ★ 标定值 -> 运行时地址 (ASLR 每次开机随机基址; 见 game_addr 模块头)
+import os as _os                                        # noqa: E402
+sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+import game_addr as _GA                                 # noqa: E402
+_GA.shift_module(globals(), "SCRIPT_TAB_ADDR")
 
 OPNAME = {
     0x0000: "END", 0x0001: "SET", 0x0002: "SET2", 0x0003: "ADD",

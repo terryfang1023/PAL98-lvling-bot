@@ -62,11 +62,19 @@ import os
 import struct
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import game_addr                          # noqa: E402  只在 --live 路径用得到
+
+# ★ 下面 5 个是**标定值**。默认的数据源是**离线 SSS.MKF**(不读进程), 只有
+#   `--live` 才用它们读运行中的游戏; 而 sdlpal.exe 开了 ASLR 且映像基址
+#   "每次开机随机一次" -> 换机器/重启后标定值就错了, 所以统一叠平移。
 PTR_ADDR = 0x00C38080      # gpGlobals->g.lprgEventObject
 N_ADDR = 0x00C38084        # gpGlobals->g.nEventObject
 SCENE_TAB = 0x00C38088     # rgScene[300]
 SCENE_NOW = 0x00C3C95A     # wNumScene
 SCRIPT_TAB_ADDR = 0x00C3AAB8   # gpGlobals->g.lprgScriptEntry
+game_addr.shift_module(globals(), "PTR_ADDR", "N_ADDR", "SCENE_TAB",
+                       "SCENE_NOW", "SCRIPT_TAB_ADDR")
 MAX_SCENES = 300
 OBJ_SIZE = 32
 OBJ_FIELDS = ["sVanishTime", "x", "y", "sLayer", "wTriggerScript",

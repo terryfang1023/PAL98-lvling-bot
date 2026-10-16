@@ -17,14 +17,22 @@
 """
 import ctypes
 import ctypes.wintypes as wt
+import os
 import struct
 import sys
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import game_addr                        # noqa: E402  地址换算 (见 game_addr 模块头)
+
 # --- 与 pal_bot_mem.py 相同的锚点体系 (勿改动; 全部为真机实测标定) ---
+#     ★ 标定值是"标定那次游戏模块的加载基址"下的绝对地址; sdlpal.exe 开了
+#       ASLR 且映像基址每次开机随机一次 -> 换机器/重启后就对不上了, 这里统一
+#       叠上本次运行的平移量。
 VIEWPORT_ADDR = 0x00C3C8FC
 INV_DELTA = 0x340                       # rgInventory - viewport (源码布局算出, dump 验证)
 INV_ADDR = VIEWPORT_ADDR + INV_DELTA    # 0x00C3CC3C
+game_addr.shift_module(globals(), "VIEWPORT_ADDR", "INV_ADDR")
 MAX_INVENTORY = 256
 ENTRY = struct.Struct("<HHH")           # wItem, nAmount, nAmountInUse
 

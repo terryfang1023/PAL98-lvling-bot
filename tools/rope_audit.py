@@ -26,6 +26,13 @@ IVP = (0x00C3C8FC - READ_AT) // 2
 IPO = (0x00C3C900 - READ_AT) // 2
 IPD = (0x00C3C958 - READ_AT) // 2
 SCENE_OFF = (0x00C3C95A - READ_AT) // 2
+# ★ 上边是标定值 -> 运行时地址 (ASLR 每次开机随机基址; 见 game_addr 模块头)。
+#   索引 (IVP/IPO/IPD/SCENE_OFF) 是"相对 READ_AT 的偏移", 与基址无关, 所以在
+#   平移 READ_AT 之前算好就不会受影响。
+import os as _os                                        # noqa: E402
+sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+import game_addr as _GA                                 # noqa: E402
+_GA.shift_module(globals(), "PTR_ADDR", "N_ADDR", "SCENE_TAB", "READ_AT")
 
 FIELDS = ["sVanishTime", "x", "y", "sLayer", "wTriggerScript", "wAutoScript",
           "sState", "wTriggerMode", "wSpriteNum", "nSpriteFrames",

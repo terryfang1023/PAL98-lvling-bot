@@ -18,15 +18,24 @@ import numpy as np
 import pal_bot as PB
 import wingeom
 import bot_explog                       # parse_snapshot (不 import pal_bot*, 无循环)
+import game_addr                        # ★ 按模块基址平移标定地址 (纯 ctypes)
 
 k32 = ctypes.windll.kernel32
 OPEN_OK = 0x0010 | 0x0400
+# ★★ 下面这些是**标定值**: 当初标定时游戏模块加载在 game_addr.CALIB_BASE
+#   (= 0x00490000)。sdlpal.exe 开了 ASLR, 而 Windows 的映像基址随机化是
+#   **按"本次开机"决定一次**的 —— 换台机器 / 重启一次就可能换个基址, 于是
+#   这些绝对地址就全错了 (轻则读到垃圾, 重则连 0x00C30000 那 64KB 都读不到,
+#   表现为 `READ_TABLE_FAIL` 退出; 2026-10-16 在另一台机器上现场踩到)。
+#   真实地址 = 标定值 + game_addr.slide(pid)。**别直接拿这些常量去读进程**,
+#   一律走 Mem 实例上的 read_at / table_addr / ... (已叠好平移)。
 READ_AT = 0x00C3C8F0
 READ_N = 120
 SCENE_ADDR = 0x00C3C95A
 TABLE_ADDR = 0x00C38088
 TABLE_REGION = 0x00C30000
 TABLE_SIZE = 0x10000
+OBJ_N_ADDR = 0x00C38084         # nEventObject (与 rgScene 同块; pal_bot_mem5 同源)
 IVP = (0x00C3C8FC - READ_AT) // 2
 IPO = (0x00C3C900 - READ_AT) // 2
 # ★ 2026-09-30 修正: 队伍朝向 wPartyDirection @0x00C3C958 -> 索引 52 (不是 51!)
@@ -87,7 +96,13 @@ def find_pal_pid():
 
 
 class Mem:
-    """内存读取器: 一次 120B 读取拿到 viewport/partyoffset/scene。"""
+    """内存读取器: 一次 120B 读取拿到 viewport/partyoffset/scene。
+
+    ★ 2026-10-16: 所有"标定地址"在构造时按 `game_addr.slide(pid)` 平移一次,
+      之后一律用实例属性 (self.read_at / self.table_addr / self.gain_addr /
+      self.levelupexp_addr / self.scene_addr / self.table_region) —— 它们是
+      **本次运行的真实地址**。模块级常量保持标定值不动 (测试按它断言)。
+    """
 
     def __init__(self):
         wins = find_pal_pid()
@@ -97,11 +112,20 @@ class Mem:
         self.h = k32.OpenProcess(OPEN_OK, False, self.pid)
         if not self.h:
             raise SystemExit("OPEN_FAIL")
+        # ---- ① 按游戏模块的实际基址求平移量 (ASLR 每次开机随机一次) ----
+        self.slide = game_addr.slide(self.pid)
+        self.read_at = READ_AT + self.slide
+        self.scene_addr = SCENE_ADDR + self.slide
+        self.table_addr = TABLE_ADDR + self.slide
+        self.table_region = TABLE_REGION + self.slide
+        self.gain_addr = self.GAIN_ADDR + self.slide
+        self.levelupexp_addr = self.LEVELUPEXP_ADDR + self.slide
+        # ---- ② 读场景表那一大块 ----
         buf = (ctypes.c_char * TABLE_SIZE)()
         got = ctypes.c_size_t()
-        if not k32.ReadProcessMemory(self.h, ctypes.c_void_p(TABLE_REGION),
+        if not k32.ReadProcessMemory(self.h, ctypes.c_void_p(self.table_region),
                                      buf, TABLE_SIZE, ctypes.byref(got)):
-            raise SystemExit("READ_TABLE_FAIL")
+            raise SystemExit(self._table_fail_msg())
         self._tw = struct.unpack('<%dH' % (got.value // 2), buf.raw[:got.value])
         off = (TABLE_ADDR - TABLE_REGION) // 2
         self.scene_map = {}
@@ -112,8 +136,27 @@ class Mem:
         self._buf = (ctypes.c_char * READ_N)()
         self._got = ctypes.c_size_t()
 
+    def _table_fail_msg(self):
+        """读场景表那块失败 -> 带现场证据的多行报错 (以前只吐 READ_TABLE_FAIL,
+        截图/日志里根本看不出为什么)。
+
+        最常见的原因就是基址被 ASLR 搬走了 (另一台机器 / 重启之后), 而
+        0x00C30000 落到了映像之外。第二常见是真换了个 exe。
+        """
+        L = ["READ_TABLE_FAIL: 读不到场景表那一块 64KB "
+             "(标定 0x%08X + slide 0x%X = 0x%08X)"
+             % (TABLE_REGION, self.slide, self.table_region),
+             "  ★ 如果是「换了台机器 / 重启过」-> 大概率是 ASLR 把游戏模块搬到"
+             "了别的基址, 而 0x00C30000 已经不在映像里"]
+        try:
+            L += ["  " + s for s in game_addr.diag_lines(self.pid)]
+        except Exception as e:
+            L.append("  诊断信息取失败: %s" % e)
+        L.append("  排查: python tools/env_check.py (只读, 不按键)")
+        return "\n".join(L)
+
     def raw(self):
-        if not k32.ReadProcessMemory(self.h, ctypes.c_void_p(READ_AT),
+        if not k32.ReadProcessMemory(self.h, ctypes.c_void_p(self.read_at),
                                      self._buf, READ_N, ctypes.byref(self._got)):
             return None
         return struct.unpack_from('<%dH' % (READ_N // 2), self._buf.raw)
@@ -156,7 +199,7 @@ class Mem:
         """
         buf = (ctypes.c_char * self.GAIN_N)()
         got = ctypes.c_size_t()
-        if not k32.ReadProcessMemory(self.h, ctypes.c_void_p(self.GAIN_ADDR),
+        if not k32.ReadProcessMemory(self.h, ctypes.c_void_p(self.gain_addr),
                                      buf, self.GAIN_N, ctypes.byref(got)):
             return None
         if got.value < self.GAIN_N:
@@ -173,7 +216,7 @@ class Mem:
         n = self.LEVELUPEXP_N * 2
         buf = (ctypes.c_char * n)()
         got = ctypes.c_size_t()
-        if not k32.ReadProcessMemory(self.h, ctypes.c_void_p(self.LEVELUPEXP_ADDR),
+        if not k32.ReadProcessMemory(self.h, ctypes.c_void_p(self.levelupexp_addr),
                                      buf, n, ctypes.byref(got)):
             return None
         if got.value < n:
@@ -194,7 +237,8 @@ class Mem:
         out = []
         W = self.raw()
         if W is None:
-            return False, ["读取 GLOBALVARS @0x%08X 失败 (进程句柄失效?)" % READ_AT]
+            return False, ["读取 GLOBALVARS @0x%08X 失败 (进程句柄失效?)"
+                           % self.read_at]
         st = self.state()
         if st is None:
             return False, ["state() 解析失败"]
@@ -207,6 +251,11 @@ class Mem:
                        % (p.name(), self.pid, p.exe() or ""))
         except Exception:
             pass
+        # ★ 2026-10-16: 基址平移量必须写进日志 —— 换机器/重启后基址会变,
+        #   出问题时第一眼就能看出"这次是按哪个基址换算的"。
+        sl = getattr(self, "slide", 0)     # 测试桩伪造的 Mem 可能没这个属性
+        out.append("地址平移 slide=%+d (标定基址 0x%08X, 本次模块基址 0x%08X)"
+                   % (sl, game_addr.CALIB_BASE, game_addr.CALIB_BASE + sl))
         out.append("场景号=%d 队伍像素 P=(%d,%d) K=%s"
                    % (sc, st["px"], st["py"], st["K"]))
         if not (1 <= sc <= 300):
@@ -238,6 +287,31 @@ class Mem:
         if ratio < 0.90:
             ok = False
             out.append("★ 场景表结构合理率 %.1f%% < 90%% -> 基址不对" % (ratio * 100))
+        # rgScene 第 4 个 WORD = 该场景对象的"累积末序号", 最后一个非空场景的
+        # 末序号必须 == nEventObject (真机 5077)。★ 这条是"整条错位"的照妖镜:
+        # 场景表是均匀结构, 平移 8 字节的整数倍时上面那条合理性率看不出来,
+        # 但 nEventObject 是个 4 字节整数, 错位后就读不到了。
+        # 2026-10-16 加 (game_addr.probe_slide 里的同一条判据, 这里做二次复核)。
+        mx = 0
+        for s in range(1, 297):
+            i = off + (s - 1) * 4
+            if i + 3 < len(self._tw):
+                mx = max(mx, self._tw[i + 3])
+        nob = None
+        if getattr(self, "h", None):        # 测试桩伪造的 Mem 没有句柄
+            nb = (ctypes.c_char * 4)()
+            ng = ctypes.c_size_t()
+            if k32.ReadProcessMemory(self.h,
+                                     ctypes.c_void_p(OBJ_N_ADDR + self.slide),
+                                     nb, 4, ctypes.byref(ng)):
+                nob = struct.unpack('<I', nb.raw)[0]
+        out.append("累积末序号 max=%d, nEventObject=%s" % (mx, nob))
+        if nob is None:
+            out.append("… 读不到 nEventObject (不影响其它判据)")
+        elif not (mx == nob and 1000 <= nob <= 6000):
+            ok = False
+            out.append("★ 累积末序号 %d != nEventObject %s -> 场景表错位/基址不对"
+                       % (mx, nob))
         # 与解码报告对照 (最强的证据: map 号是独立来源)
         if report_map and sc in report_map:
             got, exp = self.scene_map.get(sc), report_map[sc]

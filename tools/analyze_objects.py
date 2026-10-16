@@ -20,6 +20,11 @@ PTR_ADDR = 0x00C38080
 N_ADDR = 0x00C38084
 SCENE_TAB = 0x00C38088
 SCENE_NOW = 0x00C3C95A
+# ★ 标定值 -> 运行时地址 (ASLR 每次开机随机基址; 见 game_addr 模块头)
+import os as _os                                        # noqa: E402
+sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+import game_addr as _GA                                 # noqa: E402
+_GA.shift_module(globals(), "PTR_ADDR", "N_ADDR", "SCENE_TAB", "SCENE_NOW")
 MAX_SCENES = 300
 OBJ_SIZE = 32
 OBJ_FIELDS = ["sVanishTime", "x", "y", "sLayer", "wTriggerScript",
@@ -68,6 +73,7 @@ OBJ_TAB = u32at(PTR_ADDR)
 N_OBJ = u32at(N_ADDR)
 # 脚本表: 由 probe_script2 扫描确定 @0x00C3AAB8
 SCRIPT_TAB_ADDR = 0x00C3AAB8
+_GA.shift_module(globals(), "SCRIPT_TAB_ADDR")           # 同上: 叠基址平移
 SC_TAB = u32at(SCRIPT_TAB_ADDR)
 N_SC = u32at(SCRIPT_TAB_ADDR + 4)
 print("对象表 0x%08X x%d   脚本表 0x%08X x%d"

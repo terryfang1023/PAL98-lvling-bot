@@ -554,6 +554,7 @@ def stub_mem(scene=77, mapv=72, viewport=(1000, 800), table=None):
     """造一个"内存内容可控"的假 Mem (不走 __init__, 不真读进程)。"""
     m = PM.Mem.__new__(PM.Mem)
     m.pid = 999999                       # 不存在的 pid -> psutil 分支走异常
+    m.slide = 0                          # ★ 本机基址 == 标定基址 (真机另算)
     W = [0] * (PM.READ_N // 2)
     W[PM.IVP] = viewport[0] & 0xFFFF
     W[PM.IVP + 1] = viewport[1] & 0xFFFF
@@ -590,6 +591,18 @@ ok, det = stub_mem(table={s: 4000 for s in range(1, 297)}).selfcheck({})
 check("场景表整体离谱 (基址错位的典型样子) -> ok=False", not ok, "; ".join(det))
 ok, det = stub_mem().selfcheck(None)
 check("无报告表也能判 (不崩)", ok, "; ".join(det))
+
+# ★ 2026-10-16 地址平移 (ASLR 每次开机随机基址) —— 自检必须把平移量写进日志,
+#   并复核"累积末序号 == nEventObject"这条防错位判据 (没句柄的桩退化为提示)。
+ok, det = stub_mem().selfcheck({77: 72})
+check("自检报出地址平移量", any("地址平移" in d for d in det), "; ".join(det))
+check("自检报出累积末序号与 nEventObject",
+      any("nEventObject" in d for d in det), "; ".join(det))
+check("桩没有进程句柄 -> 只是提示, 不判失败", ok, "; ".join(det))
+m_stub = stub_mem()
+check("桩的 slide 显式置 0 (与标定基址一致)", m_stub.slide == 0)
+check("Mem 的地址平移入口是 game_addr.slide (唯一来源)",
+      PM.game_addr.slide is not None and hasattr(PM, "game_addr"))
 
 print("\n" + "=" * 56)
 print("通过 %d 项, 失败 %d 项" % (len(OK), len(BAD)))

@@ -148,7 +148,16 @@ def main():
             print("  %s 缩放 k=%.3f 已严重偏离标定 (1.0) —— 画面细节特征会明显变弱,"
                   " 建议把窗口调回接近 %dx%d" % (WARN, k, WG.REF_WIN[0], WG.REF_WIN[1]))
 
-    hr("③ 内存基址自检 (换 exe 最容易炸的就是这里)")
+    hr("③ 内存基址自检 (换 exe / 换机器 / 重启过 —— 最容易炸的就是这里)")
+    # ★ 2026-10-16: 先报"地址平移量"。sdlpal.exe 开了 ASLR, 而 Windows 的
+    #   映像基址随机化**按'本次开机'决定一次** -> 换机器/重启就可能换基址,
+    #   于是标定过的绝对地址全错 (轻则读到垃圾, 重则 READ_TABLE_FAIL)。
+    try:
+        import game_addr as GA                          # noqa: E402
+        for ln in GA.diag_lines():
+            print("   " + ln)
+    except Exception as e:
+        print("  %s game_addr 诊断取失败: %s" % (WARN, e))
     # 解码报告 (独立来源): 场景 -> 地图号
     report_map = {}
     try:

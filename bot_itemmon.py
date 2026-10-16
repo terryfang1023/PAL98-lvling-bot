@@ -11,10 +11,16 @@
   - rgInventory = viewport + 0x340 = 0x00C3CC3C
     (源码布局算出; tools/item_scan.py dump 实测 104 条目 ID/数量全部合理)
   - 傀儡虫物品 ID: tools/item_scan.py watch 真机差分锁定 (见 ITEM_ID 注释)
+
+★ 2026-10-16: 下边所有地址都是**标定值** (标定那次游戏模块加载在
+  game_addr.CALIB_BASE)。sdlpal.exe 开了 ASLR, 而 Windows 的映像基址随机化
+  **按"本次开机"决定一次** —— 换台机器 / 重启一次就可能换基址, 标定值就全
+  错了。所以真正读进程时一律叠 `game_addr.slide(pid)` (见 read_raw / _rd)。
 """
 import ctypes
 import ctypes.wintypes as wt
 import struct
+import game_addr                     # 只读地址换算 (纯 ctypes, 不引 pal_bot)
 
 # --- 锚点 (与 pal_bot_mem.py / tools/item_scan.py 同源, 勿单方面改动) ---
 VIEWPORT_ADDR = 0x00C3C8FC
@@ -206,7 +212,11 @@ class ItemReader:
         size = ENTRY.size * MAX_INVENTORY
         buf = (ctypes.c_char * size)()
         got = ctypes.c_size_t()
-        if not k32.ReadProcessMemory(self.h, ctypes.c_void_p(INV_ADDR),
+        # ★ 2026-10-16: INV_ADDR 是**标定值**, 必须叠上本次运行的基址平移
+        #   (ASLR 每次开机随机一个基址; 详情见 game_addr 模块头)。
+        if not k32.ReadProcessMemory(self.h,
+                                     ctypes.c_void_p(
+                                         INV_ADDR + game_addr.slide(self.pid)),
                                      buf, size, ctypes.byref(got)):
             self._drop()                 # 游戏可能退了/重启了, 下次重开
             return None
@@ -362,8 +372,15 @@ class RoleReader:
         self.pid = None
 
     def _rd(self, addr, size):
+        """按**静态标定地址**读 (自动叠本次运行的基址平移)。
+
+        ★ 本函数的 addr 一律是上边那些常量。若将来要读"游戏自己写进内存的
+          指针"(例如 rgParty 里的地址), 那个指针已经是运行时的真实地址,
+          **不能再叠平移** —— 那种情况请直接用 k32.ReadProcessMemory。
+        """
         if not self._ensure():
             return None
+        addr = addr + game_addr.slide(self.pid)
         buf = (ctypes.c_char * size)()
         got = ctypes.c_size_t()
         if not k32.ReadProcessMemory(self.h, ctypes.c_void_p(addr),

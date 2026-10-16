@@ -32,6 +32,12 @@ PTR_ADDR = 0x00C38080       # &gpGlobals->g.lprgEventObject
 N_ADDR = 0x00C38084         # &gpGlobals->g.nEventObject
 SCENE_TAB = 0x00C38088      # rgScene[]
 SCENE_NOW = 0x00C3C95A      # wNumScene
+# ★ 上边是标定值; sdlpal.exe 开了 ASLR 且映像基址"每次开机随机一次" ->
+#   换机器/重启后必须叠平移, 否则读到的是垃圾 (见 game_addr 模块头)。
+import os as _os                                        # noqa: E402
+sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+import game_addr as _GA                                 # noqa: E402
+_GA.shift_module(globals(), "PTR_ADDR", "N_ADDR", "SCENE_TAB", "SCENE_NOW")
 MAX_SCENES = 300
 OBJ_SIZE = 32
 OBJ_FIELDS = ["sVanishTime", "x", "y", "sLayer", "wTriggerScript",

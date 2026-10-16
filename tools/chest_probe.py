@@ -31,15 +31,23 @@ import os
 import struct
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import game_addr                          # noqa: E402  地址换算 (GUI 也会跑本工具)
+
 k32 = ctypes.windll.kernel32
 u32 = ctypes.windll.user32
 OPEN_OK = 0x0010 | 0x0400                 # QUERY_INFORMATION | VM_READ (只要读)
 
+# ★ 下面 5 个是**标定值**; sdlpal.exe 开了 ASLR 且映像基址"每次开机随机一次",
+#   换机器 / 重启后基址会变 -> 直接拿标定值读进程会读到垃圾。shift_module
+#   把它们换成本次运行的真实地址 (详情见 game_addr 模块头)。
 PTR_ADDR = 0x00C38080                     # lprgEventObject
 N_ADDR = 0x00C38084                       # nEventObject
 SCENE_TAB = 0x00C38088                    # rgScene[300]
 SCENE_NOW = 0x00C3C95A                    # wNumScene
 SCRIPT_TAB = 0x00C3AAB8                   # lprgScriptEntry 指针槽
+game_addr.shift_module(globals(), "PTR_ADDR", "N_ADDR", "SCENE_TAB",
+                       "SCENE_NOW", "SCRIPT_TAB")
 MAX_SCENES = 300
 OBJ_SIZE = 32
 OBJ_FIELDS = ["sVanishTime", "x", "y", "sLayer", "wTriggerScript",

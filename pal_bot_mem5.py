@@ -74,6 +74,7 @@ import bot_chestlog as chestlog                                # noqa: E402
 import bot_featlog as featlog                                  # noqa: E402
 import bot_winlog as winlog                                    # noqa: E402
 import bot_explog as gainlog                                   # noqa: E402
+import game_addr                                               # noqa: E402
 from pal_bot_mem import MemBot                                # noqa: E402
 from pal_bot_mem4 import MemBot4                              # noqa: E402
 from scene_pilot import ScenePilot                            # noqa: E402
@@ -256,13 +257,24 @@ def _game_pids():
 
 
 class _ObjMem:
-    """只读的事件对象表访问器(独立于 pal_bot_mem.Mem, 不碰它的句柄)。"""
+    """只读的事件对象表访问器(独立于 pal_bot_mem.Mem, 不碰它的句柄)。
+
+    ★ 2026-10-16 地址平移: 下边几个 OBJ_* / SCRIPT_PTR_ADDR 是**标定值**
+      (标定那次游戏模块加载在 game_addr.CALIB_BASE); sdlpal.exe 开了 ASLR,
+      而 Windows 的映像基址随机化**按"本次开机"决定一次** —— 换机器/重启就
+      可能换基址。所以读这些常量前一律过 `self._sa()` 叠平移。
+
+      ⚠ 但 `ptr = self.u32(OBJ_PTR_ADDR)` 拿回来的**指针是游戏运行时写的**,
+        它已经是真实地址 -> 之后 `ptr + n*OBJ_SIZE` 之类**绝不能再叠平移**。
+        所以这里没有把平移塞进 rd(), 而是在"读常量"的 5 个点上显式 _sa()。
+    """
 
     def __init__(self):
         self.k32 = ctypes.windll.kernel32
         self.h = None
         self.got = ctypes.c_size_t()
         self._fail = 0
+        self.slide = 0
 
     def open(self):
         if self.h:
@@ -272,6 +284,7 @@ class _ObjMem:
             if not pids:
                 self.err = "找不到标题含 Pal 的窗口"
                 return False
+            self.slide = game_addr.slide(pids[0])
             self.h = self.k32.OpenProcess(PROC_OPEN_OK, False, pids[0])
             if not self.h:
                 self.err = "OpenProcess 失败 pid=%d" % pids[0]
@@ -279,6 +292,10 @@ class _ObjMem:
             self.h = None
             self.err = "枚举窗口异常: %s" % e
         return bool(self.h)
+
+    def _sa(self, addr):
+        """静态标定地址 -> 本次运行的真实地址 (叠基址平移)。"""
+        return addr + self.slide
 
     def rd(self, addr, size):
         buf = (ctypes.c_char * size)()
@@ -297,11 +314,11 @@ class _ObjMem:
 
     def scene_objects(self, s):
         """返回场景 s 的对象原始字段元组列表(每个 16 个 WORD)。"""
-        ptr = self.u32(OBJ_PTR_ADDR)
-        n = self.u32(OBJ_N_ADDR)
+        ptr = self.u32(self._sa(OBJ_PTR_ADDR))
+        n = self.u32(self._sa(OBJ_N_ADDR))
         if not ptr or not n or n > 6000:
             return []
-        tab = self.rd(OBJ_SCENE_TAB, OBJ_MAX_SCENES * 8)
+        tab = self.rd(self._sa(OBJ_SCENE_TAB), OBJ_MAX_SCENES * 8)
         if not tab or len(tab) < OBJ_MAX_SCENES * 8:
             return []
         idxs = [struct.unpack_from("<4H", tab, i * 8)[3]
@@ -321,8 +338,8 @@ class _ObjMem:
     def _script_tab(self):
         """(脚本表指针, 条目数); 读不到返回 (None, 0)。"""
         if getattr(self, "_stab", None) is None:
-            ptr = self.u32(SCRIPT_PTR_ADDR)
-            n = self.u32(SCRIPT_PTR_ADDR + 4)
+            ptr = self.u32(self._sa(SCRIPT_PTR_ADDR))
+            n = self.u32(self._sa(SCRIPT_PTR_ADDR) + 4)
             self._stab = (ptr, n if n and 0 < n < 200000 else 0)
         return self._stab
 
@@ -416,7 +433,8 @@ class _ObjMem:
           mode*6-4 决定搜索点范围, mode=1 只查脚下半格)。
         返回 [{"K":[a,b], "spr":0, "trig":.., "mode":..}]。读不到返回 []。
         """
-        if not self.u32(OBJ_PTR_ADDR) or not self.u32(OBJ_N_ADDR):
+        if not self.u32(self._sa(OBJ_PTR_ADDR)) \
+                or not self.u32(self._sa(OBJ_N_ADDR)):
             return []
         out = []
         for f in self.scene_objects(s):
