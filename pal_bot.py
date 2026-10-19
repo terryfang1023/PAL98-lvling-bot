@@ -406,8 +406,22 @@ def _bmask_white(R, G, B):
     return (mn >= 158) & (mx - mn <= 60)
 
 
+def _bmask_hp(R, G, B):
+    """HP 数字证据 (v2.1): 暖白 ∪ 青绿。
+
+    单人队伍 (十里坡开局) 的战斗面板是**暗色样式**: HP 数字是青绿
+    (实测 (96,180,168)), 暖白掩码完全接不住; 但它 G-B 只差 12, 也进不了
+    绿掩码 (要求 G>B+15)。这里单独给一条青绿通道:
+      G>=140 挡掉暗草/树叶, B>=G-45 排掉黄绿枝叶 (B 远小于 G),
+      G>R+40 保证是"冷色亮字"。
+    只用作 MP 数字锚上方窗口内的"上一行数字"证据, 不独立成锚。
+    """
+    teal = (G >= 140) & (G > R + 40) & (B >= G - 45) & (B <= 230)
+    return _bmask_white(R, G, B) | teal
+
+
 def _bmask_brown(R, G, B):
-    """状态栏面板底色 (bfrac 只在数字锚定的矩形内统计, 不看全图):
+    """状态栏面板底色 (v2 口径, 白字通道专用; bfrac 只在数字锚定的矩形内统计):
     深棕 (62,28,13, 7月标定) / 砖红 (148,32,24, 场景185 实测) 两族都要认。"""
     brown = (R >= 38) & (R <= 95) & (G >= 8) & (G <= 60) & (B >= 0) & (B <= 40) \
         & (R > G + 15) & (G >= B)
@@ -415,8 +429,15 @@ def _bmask_brown(R, G, B):
     return brown | brick
 
 
+def _bmask_dark(R, G, B):
+    """单人战斗面板的暗褐底色 (2026-10-19 十里坡实测 (24,16,8))。
+    R>G 的暖色次序排除暗灰洞穴 (R≈G); 只用于青字堆叠通道, 不碰白字通道。"""
+    return (R >= 14) & (R <= 95) & (G >= 4) & (G <= 60) & (B >= 0) & (B <= 45) \
+        & (R > G) & (G >= B - 4)
+
+
 def battle_ui_feat(a, band0=None):
-    """战斗底部 UI 精确特征 (v2, 2026-09-30): 绿色 MP 数字锚定法。
+    """战斗底部 UI 精确特征 (v2, 2026-09-30; v2.1 单人暗面板 2026-10-19): 绿色 MP 数字锚定法。
 
     旧 is_battle = 底部 30% 波段里数"棕框像素"和"青字像素":
       * 棕框掩码被场景污染 —— 熔岩地图 19% 的地面像素命中"棕框"色;
@@ -427,6 +448,10 @@ def battle_ui_feat(a, band0=None):
       3. 数字周围 2.8dh 高的矩形内棕框占比 ≥0.18 (状态栏底板)。
     所有尺寸以数字高度 dh 自标定 -> 天然抗窗口缩放; 场景再红也造不出
     "绿数字+上方白数字+周围棕框"三件套。
+    v2.1 (2026-10-19 十里坡): **单人队伍的战斗面板是另一种样式** ——
+      暗褐底板 (24,16,8) + 青绿 HP 数字 (96,180,168), 白字/棕框两关全挂,
+      机器人整场战斗判"不在战斗" -> 走图被挡死循环。新增青字堆叠通道
+      (HP 证据 = 白 ∪ 青绿, 且须与 MP 行同量级行高 + MP 行有列空隙)。
     返回 dict(band_top, green, spans=[...], ok)。
     """
     h, w = a.shape[:2]
@@ -459,7 +484,9 @@ def battle_ui_feat(a, band0=None):
         p = x
     groups.append((s, p))
     wm_all = _bmask_white(R, G, B)
+    hm_all = _bmask_hp(R, G, B)
     bm_all = _bmask_brown(R, G, B)
+    dm_all = _bmask_dark(R, G, B)
     for (x0, x1) in groups:
         sw = x1 - x0 + 1
         if sw < max(8, int(w * 0.02)):    # 数字块宽度 (1634 宽实测 ~150px)
@@ -491,14 +518,46 @@ def battle_ui_feat(a, band0=None):
             gcnt = int(gm[y0:y1 + 1, x0:x1 + 1].sum())
             if gcnt < 30:
                 continue
+            # ---- 列空隙: 数字字形必有笔划间隙, 整块衣物/图标没有 (单人通道用) ----
+            colc = gm[y0:y1 + 1, x0:x1 + 1].sum(axis=0)
+            nz = np.nonzero(colc > 0)[0]
+            gaps = int((~colc[nz[0]:nz[-1] + 1].astype(bool)).sum()) if nz.size else 0
             wy0, wy1 = max(0, y0 - int(2.6 * dh)), max(0, y0 - int(0.2 * dh))
             wcnt = int(wm_all[wy0:wy1, x0:x1 + 1].sum()) if wy1 > wy0 else 0
+            hcnt = int(hm_all[wy0:wy1, x0:x1 + 1].sum()) if wy1 > wy0 else 0
             by0, by1 = max(0, y0 - int(2.8 * dh)), min(bh, y1 + int(0.8 * dh))
             barea = max(1, (by1 - by0) * sw)
             bfrac = float(bm_all[by0:by1, x0:x1 + 1].sum()) / barea
-            ok = (wcnt >= 0.35 * gcnt) and (bfrac >= 0.18)
+            # ---- HP 证据两条路 ----
+            #   ① 白字 (三人队亮棕面板, v2 标定, 口径不动): 白 >= 0.35x绿 + 棕框 >=0.18
+            #   ② 青字堆叠 (v2.1 单人暗面板): HP 是青绿数字, 与 MP 行同宽相邻堆叠。
+            #      四道闸门 (实测绿毛怪站在棕岩上会骗过前两道):
+            #      a. MP 锚 >=250 绿像素 (真 MP 数字最小窗口 ~400);
+            #      b. MP 行有 >=3 处列空隙 (数字字形; 整块衣物/怪物身体没有);
+            #      c. 面板矩形底色均匀度 >=0.20 (距逐通道中位数 +-14 的像素占比;
+            #         真面板 0.32~0.59, 岩石/杂景 0.01~0.07);
+            #      d. 面板底色认暗褐 (单人面板 (24,16,8)), 且 HP 证据行高与 MP 行
+            #         同量级 0.45~2.3 倍 (挡头旗/衣领碎片)。
+            stack_ok = False
+            dfrac = float(dm_all[by0:by1, x0:x1 + 1].sum()) / barea
+            if hcnt >= 0.35 * gcnt and gcnt >= 250 and gaps >= 3 \
+                    and dfrac >= 0.18 and wy1 > wy0:
+                prof = hm_all[wy0:wy1, x0:x1 + 1].sum(axis=1) > 0
+                best = cur = 0
+                for v in prof:
+                    cur = cur + 1 if v else 0
+                    if cur > best:
+                        best = cur
+                if 0.45 * dh <= best <= 2.3 * dh:
+                    px = band[by0:by1, x0:x1 + 1].reshape(-1, 3).astype(np.int32)
+                    med = np.median(px, axis=0)
+                    unif = float((np.abs(px - med) <= 14).all(axis=1).mean())
+                    stack_ok = unif >= 0.20
+            hp_ok = (wcnt >= 0.35 * gcnt) and (bfrac >= 0.18)
+            ok = hp_ok or (stack_ok and (dfrac >= 0.18))
             feat["spans"].append({"x": (x0 + x1) // 2, "y": top + (y0 + y1) // 2,
                                   "dh": dh, "green": gcnt, "white": wcnt,
+                                  "teal": hcnt, "stack": stack_ok, "gaps": gaps,
                                   "brown": round(bfrac, 3), "ok": ok})
             if ok:
                 feat["ok"] = True

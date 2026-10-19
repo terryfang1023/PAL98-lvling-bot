@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""battle_probe.py — 战斗/菜单判定只读探针 (2026-09-30, is_battle v2 配套)。
+"""battle_probe.py — 战斗/菜单判定只读探针 (2026-09-30, is_battle v2/v2.1 配套)。
 
 ★ 零副作用声明 (纪律见 live-process-safe-diagnostics 技能):
   * 只 PrintWindow 截屏, 不按任何键, 不碰 mem_stop.flag / .pal_bot.lock;
@@ -69,11 +69,12 @@ def probe(save=False):
         red, tan = MemBot2._menu_feat(a)
         menu = MemBot2._menu_like(red, tan)
         print("窗口 #%d hwnd=%s 「%s」 帧 %dx%d" % (i, hwnd, title, a.shape[1], a.shape[0]))
-        print("  [战斗判定 v2] ok=%s  绿MP数字=%d  波段顶=%d"
+        print("  [战斗判定 v2.1] ok=%s  绿MP数字=%d  波段顶=%d"
               % (f["ok"], f["green"], f["band_top"]))
         for s in f["spans"]:
-            print("    数字块 x=%d y=%d 数字高=%d 绿=%d 白=%d 棕框=%.2f -> %s"
+            print("    数字块 x=%d y=%d 数字高=%d 绿=%d 白=%d 青=%d 堆叠=%s 隙=%d 棕框=%.2f -> %s"
                   % (s["x"], s["y"], s["dh"], s["green"], s["white"],
+                     s.get("teal", -1), s.get("stack"), s.get("gaps", -1),
                      s["brown"], "命中 ✓" if s["ok"] else "未命中"))
         cap = MemBot2.MENU_RED_CAP
         if red >= cap:
