@@ -457,6 +457,19 @@ def cheb(p, q):
 
 
 class MemBot5(MemBot4):
+    # ---- 驻留练级 (2026-10-20) ----
+    #   PIN_BAN_PAD: 出口禁区半径(格)。为什么不是 0 —— 门的触发对象与"踩到的
+    #     那一格"经常差 1~2 格(十里坡实测: 对象在 [-63,179] 附近, 队伍在
+    #     相对位置踩响), 只禁门格等于没禁。禁 3 个门 ≈ 75 格, 对 5891 格的
+    #     十里坡只损失 1.3%, 换"绝不误出门"划算。
+    #   PIN_EXIT_TTL: 出口清单缓存寿命。对象表一次扫描要几十次 ReadProcessMemory,
+    #     不能每 tick 扫; 60 秒刷一次足够 (门是地图景物, 不会每秒变)。
+    PIN_BAN_PAD = 2
+    PIN_EXIT_TTL = 60.0
+    PIN_BACK_MAX = 5             # 连续 N 次走不回去 -> 停止尝试并告警
+    PIN_REACH_KEEP = 0.6         # 门禁后可达域 >= 无门禁的 60% 就算"够用"
+    PIN_REACH_ABS = 80           # ...但绝对不低于 80 格 (再小就是把路锁死了)
+
     # ---- 触发圈几何 (2026-09-29 实测修正) ----
     # ★ 只有「正交 4 邻格」才算进了触发圈。原先的 3x3 邻域含 4 个斜角格,
     #   站到斜角格上引擎**不触发**战斗(实测: K(-74,104)/K(-74,100) 两个点
@@ -673,6 +686,37 @@ class MemBot5(MemBot4):
                      "feat_mark": 0, "far_battle": 0, "feat_pick": 0}
         self._scene_links = {}      # (旧场景, 门K) -> 新场景 (穿门学习, 持久化)
         self._link_file = os.path.join(BASE, "scene_links.json")
+        # ---- ★ 驻留练级 (2026-10-20, 用户要求) ----
+        #   原话: 「在某个地方练级的时候, 机器人不会主动离开, 并且会自动避开
+        #   出入口, 以防误离开」。三层防护, 缺一层就会重演 10-20 事故
+        #   (在十里坡练了一夜, 早上自己漂到场景 2/4 来回横跳 512 次):
+        #     ① 主动层: 不迁移 / 不换场景 / 不爬绳 / step 里每帧复位 migrate
+        #     ② 被动层: 出口禁区 pad=2 (scene_exits 实时扫脚本里的换景指令),
+        #        且门禁分级**永不降到「无门禁」**
+        #     ③ 兜底层: 真被脚本/没登记的门送出去 -> 按 scene_links 走回来
+        #   开关: 环境变量 PAL_PIN_SCENE > bot_config.json > 0 (不驻留)
+        #   ★ 取值语义: 0 = 不驻留; >0 = 钉住这个场景号; **-1 = 钉住「启动时
+        #     所在的场景」** (GUI 勾了驻留但没填号时就是它 —— 用户把队伍带到
+        #     练级点、点开始, 就钉在那儿了, 完全不用知道场景号是多少)。
+        _pin_v = cfg_int("pin_scene", 0)
+        self._pin_auto = _pin_v < 0
+        self.pin_scene = max(0, _pin_v)
+        self._pin_back = False      # 正在「走回驻留场景」的模式
+        self._pin_back_n = 0        # 连续返回失败次数
+        self._pin_open_tmp = False  # 回场时临时打开的穿门
+        self._pin_warn_t = 0.0      # 回场告警节流
+        self._pin_hold_t = 0.0      # 「拦下迁移」日志节流
+        self._exit_cache = None     # (scene, 时刻, 出口清单) 实时扫描缓存
+        if self.pin_scene:
+            self.auto_scene = False          # 决策层换场景整个关掉
+            self.log("[驻留] ★ 已钉住场景 %d: 不主动换场景 / 出入口 %d 格禁区 / "
+                     "被送出去会自动走回来" % (self.pin_scene, self.PIN_BAN_PAD))
+            self.log("[驻留]    (想解除: GUI 把「驻留练级」的勾去掉再启动, "
+                     "或把 bot_config.json 里的 pin_scene 改回 0)")
+        elif self._pin_auto:
+            self.auto_scene = False          # 决策层换场景整个关掉
+            self.log("[驻留] ★ 驻留 = 「启动时所在的场景」: 落地即钉住, "
+                     "不再迁移/换场景/爬绳")
         self._load_scene_info()
         self._init_pilot()
 
@@ -770,6 +814,279 @@ class MemBot5(MemBot4):
         self._pilot_finish_change()
         # ★ v18.9: 落地就体检一次宝箱 —— 已开空/不可触发的箱子本局不再认
         self._chest_mem_tick(sc)
+        # ★ 驻留 (2026-10-20): 每次落地都核对是不是还在钉住的场景里
+        self._pin_scene_tick(sc, why)
+
+    # ==================================================================
+    #  ★ 驻留练级 (2026-10-20)
+    #  用户要求: 「在某个地方练级的时候, 机器人不会主动离开, 并且会自动避开
+    #  出入口, 以防误离开」。十个字的意思都落到下面的三层防护上:
+    #    ① 主动不离开 —— pick_target/tick/_pilot_tick/step 各自拦一道
+    #    ② 避开出入口 —— scene_exits 实时扫「触发脚本走得到 0x0059」的对象,
+    #       不等静态快照, 也不管它有没有贴图
+    #    ③ 万一离开 —— 按 scene_links 门路图走回 pin_scene
+    # ==================================================================
+    def _pin_on(self):
+        return bool(getattr(self, "pin_scene", 0))
+
+    def home_active(self):
+        """驻留时禁用 mem2 的「回家」—— 它和 _pin_back 是同一件事的两种实现,
+        同时开会互相抢目标 (一个往 pin 走, 一个往"来的那个门"走)。"""
+        if self._pin_on():
+            if getattr(self, "home", None):
+                self.home = None
+            return False
+        return super().home_active()
+
+    def _trap_escape(self, cur, now):
+        """困区突围。★ 父类挑的是「未禁门可达域里最远的格」—— 那个格十有八九
+        就是场景另一头的出口 (最远的点往往是门口)。驻留时必须把目标拉回禁区内,
+        宁可少突围一次, 也不能顺着突围把自己送出去。"""
+        super()._trap_escape(cur, now)
+        if not self._pin_on():
+            return
+        if self.migrate:
+            self.migrate = False
+            self.log("[困区] 驻留: 父类那条逃逸路要换场景 -> 否决, 继续找场内目标")
+        tg = getattr(self, "_trap_goal", None)
+        if tg is None:
+            return
+        goal = tg[1]
+        ban, reach = self.plan_ctx(cur)
+        if goal in reach and goal not in ban:
+            return
+        cand = [c for c in reach if c not in ban and cheb(c, cur) > 0]
+        if not cand:
+            self._trap_goal = None
+            self.log("[困区] 驻留: 禁区之外没有更远的格 -> 放弃这次突围")
+            return
+        g2 = max(cand, key=lambda c: cheb(c, cur))
+        self._trap_goal = (self.scene, g2, tg[2])
+        self.log("[困区] 驻留: 原突围点 K%s 在禁区/不通 -> 改 K%s" % (goal, g2))
+
+    def scene_exits(self, sc=None, fresh=False):
+        """本场景**所有**会换场景的触发点 —— 实时读, 不看静态快照。
+
+        判据只有一条: 触发脚本的控制流**走得到 OP_CHANGESCENE (0x0059)**。
+        故意不看 sprite / wTriggerMode, 因为:
+          · 十里坡的门是隐形对象 (spr=0), 贴图画在地图背景里;
+          · 0<mode<4 = 按键搜索型 (绳子), mode>=4 = 走近触发型 (门/洞);
+          · 还有**脚本动态创建**的出口 —— 静态 scene_info.json 里压根没有。
+        2026-10-20 事故实证: 踩响的是 K(-79,89), 而 scene_info 里场景 7 只有
+        [-63,179] / [-4,13] 两个洞, 静态表全漏 -> 只能实时扫。
+
+        返回 [{"K":(a,b), "spr":, "mode":, "trig":, "how":"near"/"search"}];
+        **读不到对象表/脚本表 -> None** (调用方必须区分"没有出口"与"读不到",
+        后者不能当成"安全"来处理)。
+        """
+        sc = self.scene if sc is None else sc
+        if sc is None:
+            return None
+        now = time.time()
+        c = getattr(self, "_exit_cache", None)
+        if (not fresh and c is not None and c[0] == sc
+                and now - c[1] < self.PIN_EXIT_TTL):
+            return c[2]
+        try:
+            objs = self.scene_objects(sc)
+        except Exception:
+            objs = None
+        if not objs:
+            self._exit_cache = (sc, now, None)
+            return None
+        ptr, n_sc = self._script_tab()
+        if not ptr or not n_sc:
+            self._exit_cache = (sc, now, None)
+            return None
+        out = []
+        for f in objs:
+            spr, trig, auto, state, mode = f[8], f[4], f[5], f[6], f[7]
+            hit = set()
+            for e in (trig, auto):
+                if e:
+                    hit |= self.script_hits(e, (OP_CHANGESCENE,))
+            if OP_CHANGESCENE not in hit:
+                continue
+            a, b = kof(f[1], f[2])
+            out.append({"K": (a, b), "spr": spr, "mode": mode, "trig": trig,
+                        "how": "near" if mode >= 4 else "search"})
+        self._exit_cache = (sc, now, out)
+        return out
+
+    def door_ban(self, pad):
+        """门禁。驻留模式**额外**把实时扫出来的所有出口圈起来。
+
+        父类只在「穿门模式」下才撤门禁; 驻留是相反诉求, 所以这里先拿父类的
+        结果, 再把 scene_exits 叠上去 —— 两者同时开时驻留优先 (安全 > 效率)。
+        """
+        s = super().door_ban(pad)
+        if not self._pin_on():
+            return s
+        for e in (self.scene_exits() or ()):
+            a, b = e["K"]
+            for ua in range(-pad, pad + 1):
+                for ub in range(-pad, pad + 1):
+                    s.add((a + ua, b + ub))
+        return s
+
+    def graded_reach(self, cur):
+        """门禁分级。驻留模式下**绝不降到「无门禁」**。
+
+        父类三档: pad=0 -> 仅实测门 -> 无门禁, 判据是"可达域 >= REACH_MIN
+        (2000 格)"。小场景/室内几乎必然小于 2000, 于是门禁被撤, 队伍直奔门口
+        —— 10-20 那一夜日志里 765 次 `无门禁` 就是这个口子。
+
+        驻留模式改成 pad=2 -> pad=1 -> pad=0, 而且"够不够用"用**比例**判
+        (相对无门禁可达域), 不是 2000 格绝对值:
+          · 十里坡 5891 格 -> 门槛 3534, pad=2 后 5816 -> 直接停在 pad=2
+          · 小房间 480 格 -> 门槛 288, pad=2 后 405 -> 还是 pad=2
+        只有窄到"门锁咽喉"的地方才会降级 (那本来就该降), 但永远不撤门禁。
+        """
+        if not self._pin_on():
+            return super().graded_reach(cur)
+        blk = set(self.blocked) - {cur}
+        ref = len(self.reach(cur, blk))              # 无门禁基准
+        need = max(self.PIN_REACH_ABS, int(ref * self.PIN_REACH_KEEP))
+        best = None
+        for tag, pad in (("驻留pad=%d" % self.PIN_BAN_PAD, self.PIN_BAN_PAD),
+                         ("驻留pad=1", 1),
+                         ("驻留pad=0", 0)):
+            b = (self.door_ban(pad) | blk) - {cur}
+            rr = self.reach(cur, b)
+            if best is None or len(rr) > len(best[2]):
+                best = (b, tag, rr)
+            if len(rr) >= need:
+                break
+        return best
+
+    def _pin_scene_tick(self, sc, why=""):
+        """落地核对: 还在钉住的场景里吗? 不在就进入「走回去」模式。"""
+        # ★ -1 = 钉住「启动时所在的场景」: 第一次落地就地取材
+        if getattr(self, "_pin_auto", False) and not self.pin_scene and sc:
+            self.pin_scene = int(sc)
+            self.log("[驻留] ★ 已自动钉住当前场景 %d (%s): 从这里开始不再离开"
+                     " (下次想钉别处就把队伍带过去再启动)"
+                     % (self.pin_scene, why or "启动"))
+        if not self._pin_on():
+            return
+        self._exit_cache = None          # 换场景了, 出口清单必须重扫
+        # ★ 驻留时「回家」(mem2 那套)一律作废: 它也是"走回某个场景",
+        #   两套同时开会互相抢目标。统一由 _pin_back 管。
+        if getattr(self, "home", None):
+            self.home = None
+        if sc == self.pin_scene:
+            if getattr(self, "_pin_back", False):
+                self.log("[驻留] ★ 已回到驻留场景 %d (%s)"
+                         % (sc, why or "?"))
+            self._pin_back = False
+            self._pin_back_n = 0
+            if getattr(self, "_pin_open_tmp", False):
+                if hasattr(self, "_open_doors_user"):
+                    self.open_doors = self._open_doors_user
+                self._pin_open_tmp = False
+            return
+        self._pin_back = True
+        self.log("[驻留] ★★ 意外离开驻留场景 %d -> 场景 %d (%s) -> 立刻走回去"
+                 % (self.pin_scene, sc, why or "?"))
+
+    def _pin_link_door(self, cur):
+        """在本场景里找一个「出去能到 pin_scene」的出口格 —— 优先真踩过的。
+
+        走法: scene_links 的键是 "旧场景:A,B"、值是 "新场景"。只挑键的场景
+        部分 == 当前场景、值 == pin_scene 的那些, 那就是**一步能回去**的门。
+        没有 -> None (调用方退化为"随便找个出口赌一把")。
+        """
+        links = getattr(self, "_scene_links", None) or {}
+        hit = []
+        for key, tgt in links.items():
+            try:
+                if int(tgt) != self.pin_scene:
+                    continue
+                sc_s, kk = str(key).split(":", 1)
+                if int(sc_s) != self.scene:
+                    continue
+                a, b = [int(x) for x in kk.split(",")]
+            except Exception:
+                continue
+            hit.append((a, b))
+        if not hit:
+            return None
+        ks = self.kwalk(self.map) if self.map is not None else set()
+        hit = [k for k in hit
+               if any((k[0] + da, k[1] + db) in ks
+                      for da in (-1, 0, 1) for db in (-1, 0, 1))]
+        if not hit:
+            return None
+        hit.sort(key=lambda k: cheb(k, cur))
+        return hit[0]
+
+    def _pin_back_fail(self, why=""):
+        """回不去时的收尾: 计数 + 告警, 连败到上限就放弃 (别把时间全耗在门上)。"""
+        self._pin_back_n = getattr(self, "_pin_back_n", 0) + 1
+        now = time.time()
+        if self._pin_back_n >= self.PIN_BACK_MAX:
+            self._pin_back = False
+            if now - getattr(self, "_pin_warn_t", 0.0) > 60:
+                self._pin_warn_t = now
+                self.log("[驻留] !!! 连续 %d 次走不回场景 %d (%s) -> 停止尝试, "
+                         "请手动把队伍带回, 否则只会在场景 %d 里原地刷"
+                         % (self._pin_back_n, self.pin_scene, why or "无路",
+                            self.scene))
+            return
+        if now - getattr(self, "_pin_warn_t", 0.0) > 30:
+            self._pin_warn_t = now
+            self.log("[驻留] 走不回场景 %d (%s) 第 %d 次 -> 换个出口再试"
+                     % (self.pin_scene, why or "无路", self._pin_back_n))
+
+    def _pin_return_target(self, cur=None):
+        """「走回驻留场景」模式下, 返回该走的那一格 (出口旁的可站格)。
+
+        ★ 这里**故意不禁门**: 目标是出门, 禁门等于原地罚站。
+        """
+        if cur is None:
+            cur = self.mem.state()["K"]
+        ks = self.kwalk(self.map) if self.map is not None else set()
+        if not ks:
+            return None
+        want = self._pin_link_door(cur)
+        if want is not None:
+            # 优先: 有"真踩过能回去"的门 -> 直奔它 (站到门格上即可)
+            if cheb(want, cur) == 0:
+                return want              # 已经站上去了, 再走一步触发
+            if want in ks:
+                return want
+        ex = self.scene_exits()
+        cand = []
+        if ex:
+            for e in ex:
+                k = e["K"]
+                if k in ks:
+                    cand.append(k)
+                else:
+                    for da, db in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                        t = (k[0] + da, k[1] + db)
+                        if t in ks:
+                            cand.append(t)
+                            break
+        if not cand:
+            # 对象表里没有出口 (或读不到) -> 退回静态门表
+            for src in (getattr(self, "report_doors", {}) or {},
+                        getattr(self, "known_doors", {}) or {}):
+                for k in (src.get(self.scene, ()) or ()):
+                    k = (int(k[0]), int(k[1]))
+                    if k in ks:
+                        cand.append(k)
+        if not cand:
+            self._pin_back_fail("本场景找不到任何出口")
+            return None
+        cand = [c for c in cand if cheb(c, cur) > 0] or cand
+        cand.sort(key=lambda c: cheb(c, cur))
+        # 回场要能穿门: 临时打开 (回到 pin 场景时 _pin_scene_tick 会还原)
+        if not self.open_doors:
+            self._open_doors_user = False
+            self.open_doors = True
+            self._pin_open_tmp = True
+        return cand[0]
 
     # ------------------------------------------------------------------
     #  ★ v18.9 宝箱内存体检: "是空箱子就完全忽略" (用户 2026-10-04 要求)
@@ -893,6 +1210,8 @@ class MemBot5(MemBot4):
 
     def _pilot_tick(self):
         """每个 tick 检查一次「这个场景还值不值得待」。"""
+        if self._pin_on():
+            return                       # 驻留: 不问"值不值得待", 答案永远是待
         if self.pilot is None or not self.auto_scene or not self.elem_mode:
             return
         if self.migrate:
@@ -1493,6 +1812,15 @@ class MemBot5(MemBot4):
         return self.MON_GOAL_TTL + 1.0 * cheb(mk, cur)
 
     def pick_target(self, exclude=None):
+        # ★ 驻留 (2026-10-20): 被人送错场景时, 一切目标让位给"走回去"
+        if self._pin_on() and getattr(self, "_pin_back", False):
+            t = self._pin_return_target()
+            if t is not None:
+                return t
+        # ★ 驻留: 父类分支会按 NO_MONSTER / 步数把 migrate 打开, 这里先复位
+        #   (tick 里还有一道, 双保险; 关掉 migrate 才会走下面的正常选点)
+        if self._pin_on() and self.migrate:
+            self.migrate = False
         if not self.elem_mode or self.migrate or self.home_active():
             return MemBot4.pick_target(self, exclude)
         cur = self.mem.state()["K"]
@@ -1829,9 +2157,30 @@ class MemBot5(MemBot4):
     # ------------------------------------------------------------------
     #  开宝箱: 走到相邻格 -> 朝箱子按方向键(被挡=只转身) -> 按空格搜索
     # ------------------------------------------------------------------
+    def step(self, key):
+        """每走一步同步迁移阈值。★ 驻留时永远不涨 (父类按"本场景打过仗没有"
+        在 150 / 99999 之间来回切, 一旦某个场景刚进来还没开打就会 150 步就迁)。"""
+        r = super().step(key)
+        if self._pin_on():
+            self.MIGRATE_AFTER = 99999
+        return r
+
     def tick(self):
-        # ★ v18.2 绳子最高优先级放最前面: 遇到就爬 (不等换场景判定)
-        self._rope_hunt()
+        if self._pin_on():
+            # ★★ 驻留的主动层最后一道闸: 不管哪条路径 (NO_MONSTER 强迁 / 30 秒
+            #    受困强迁 / 调度器) 把 migrate 打开了, 这一帧就复位。宁可原地
+            #    多等一会儿, 也不能"自己走出去"(用户要求的就是这个)。
+            self._rope_goal = None           # 绳子 = 换层, 驻留时一并不许
+            if self.migrate and not getattr(self, "_pin_back", False):
+                self.migrate = False
+                now = time.time()
+                if now - getattr(self, "_pin_hold_t", 0.0) > 60:
+                    self._pin_hold_t = now
+                    self.log("[驻留] 拦下一次自动迁移/换场景 (钉在场景 %d 不离开)"
+                             % self.pin_scene)
+        else:
+            # ★ v18.2 绳子最高优先级放最前面: 遇到就爬 (不等换场景判定)
+            self._rope_hunt()
         self._pilot_tick()          # 再判「这个场景还值不值得待」
         if self.elem_mode:
             self._trap_check()      # 困区逃逸 (熔岩走廊假通路)

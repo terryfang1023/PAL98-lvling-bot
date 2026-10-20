@@ -98,6 +98,7 @@ class BotGUI:
         self.elem = (0, 0, 0)            # (怪点命中, 走到没打, 开箱成功)
         self.chg = 0                     # 自动换场景次数
         self.cur_scene = None            # 解析出的当前场景
+        self.pin_active = 0              # 本次运行钉住的场景号 (0 = 不驻留)
         self.t_start = None
 
         self._build_params()
@@ -306,6 +307,25 @@ class BotGUI:
             side="left")
         ttk.Label(r2b5, text="场去一次没走过的区域 (探索配额)",
                   foreground="#666").pack(side="left", padx=(1, 0))
+
+        # ---- ★ 驻留练级 (2026-10-20 用户诉求) ----
+        #   「在某个地方练级的时候, 机器人不会主动离开, 并且会自动避开出入口」。
+        #   引擎没有场景名表 (地名从不显示), 所以只能按**场景号**钉; 场景号
+        #   在状态栏一直显示, 点「取当前」就从日志里抄一个, 不用记地名。
+        r2b6 = ttk.Frame(f); r2b6.pack(fill="x", pady=(0, 2))
+        _pin0 = botcfg.resolve_int("pin_scene")[0]
+        self.v_pin_on = tk.BooleanVar(value=(_pin0 != 0))
+        ttk.Checkbutton(r2b6, text="驻留练级 (钉住一个场景, 绝不主动离开)",
+                        variable=self.v_pin_on).pack(side="left", padx=(10, 0))
+        ttk.Label(r2b6, text="场景号").pack(side="left", padx=(14, 2))
+        self.v_pin_scene = tk.StringVar(
+            value=str(_pin0) if _pin0 > 0 else "")
+        ttk.Entry(r2b6, textvariable=self.v_pin_scene, width=5).pack(
+            side="left")
+        ttk.Button(r2b6, text="取当前", width=7,
+                   command=self.pin_take_current).pack(side="left", padx=4)
+        ttk.Label(r2b6, text="(留空 = 钉住启动时所在的场景; 出入口自动圈禁区)",
+                  foreground="#666").pack(side="left", padx=(4, 0))
 
         # ---- 自动存盘 (pal_bot_heal.py 的菜单宏; 内部标识沿用 heal_* 历史名,
         #      2026-10-13 用户把这项功能从"补血"改成"存盘" —— 引擎本来就是
@@ -520,6 +540,21 @@ class BotGUI:
     def _err(self, title, msg):
         messagebox.showerror(title, msg, parent=self.root)
 
+    def pin_take_current(self):
+        """把状态栏的「场景 N」抄进驻留框 —— 用户不必知道地名, 也不必记编号。"""
+        sc = self.cur_scene
+        if not sc:
+            self._err("还没有场景号",
+                      "机器人还没报出当前场景 (状态栏会显示「场景 N」)。\n\n"
+                      "两种办法:\n"
+                      "  ① 先点「▶ 开始」, 等状态栏出现「场景 N」, 再点「取当前」;\n"
+                      "  ② 直接在左边的框里手填场景号。")
+            return
+        self.v_pin_scene.set(str(sc))
+        self.v_pin_on.set(True)
+        self.log_line("[GUI] 驻留场景 = %d (抄自机器人日志), 下次点「开始」生效"
+                      % sc)
+
     def start(self):
         if self._running():
             self._err("提示", "机器人已在运行中。")
@@ -594,6 +629,25 @@ class BotGUI:
             botcfg.put("heal_gap", heal_gap)
         except Exception as ex:
             self.log_line("[GUI] 存盘设置写盘失败 (不影响本次运行): %s" % ex)
+        # ★ 驻留练级 (2026-10-20): 钉住场景号 -> 机器人不迁移/不换场景/不爬绳,
+        #   并把该场景所有"触发脚本能换景"的对象圈成禁区; 万一被送出去会走回来。
+        #   ★ 没填场景号时传 -1 = 钉住「启动时所在的场景」—— 把队伍带到练级点
+        #     再点开始就行, 用户完全不需要知道场景号 (引擎也没有地名表)。
+        pin_on = bool(self.v_pin_on.get())
+        try:
+            pin_val = int(str(self.v_pin_scene.get()).strip() or "0")
+        except ValueError:
+            pin_val = 0
+        if pin_on and pin_val <= 0:
+            pin_val = int(self.cur_scene or 0)     # 界面上有就顺手抄一个
+            if pin_val > 0:
+                self.v_pin_scene.set(str(pin_val))
+        pin = (pin_val if pin_val > 0 else -1) if pin_on else 0
+        try:
+            botcfg.put("pin_scene", pin)
+        except Exception as ex:
+            self.log_line("[GUI] 驻留设置写盘失败 (不影响本次运行): %s" % ex)
+        self.pin_active = pin
         secs = mins * 60
         args = [exe, "-u", "pal_bot_mem5.py", str(maxb), str(secs),
                 str(r0), str(rmax), self.v_bias.get(),
@@ -607,6 +661,8 @@ class BotGUI:
         #    (母目录/仓库目录) 不一致。
         env = dict(ENV_UTF8)
         env[botcfg.env_name("attack_key")] = atk
+        # ★ 驻留场景号 (0 = 不驻留): 与 GUI 上这一刻的值钉死
+        env[botcfg.env_name("pin_scene")] = str(pin)
         # 绳子攀爬开关 (pal_bot_mem5: 无门可走时用绳子换层)
         rope_on = bool(self.v_rope.get())
         try:
@@ -688,6 +744,13 @@ class BotGUI:
                           else ("仅无门时" if rope_on else "关")),
                          ("λ=" + lam) if fresh_on else "关",
                          ("每%d场" % explore_every) if explore_on else "关"))
+        if pin:
+            self.log_line("[GUI] ★ 驻留 = %s: 不迁移/不换场景/不爬绳, "
+                          "出入口圈 %d 格禁区, 真被送出去会自动走回来"
+                          % (("场景 %d" % pin) if pin > 0
+                             else "启动时所在的场景 (落地即钉住)", 2))
+        else:
+            self.log_line("[GUI] 驻留 = 关 (效率驱动, 该换场景就换)")
 
     def stop(self):
         if not self._running():
@@ -1221,11 +1284,13 @@ class BotGUI:
                 extra = " | 怪点命中 %d (走到没打 %d) | 开箱 %d" % (hit, miss, box)
             if self.chg:
                 extra += " | 换场景 %d 次" % self.chg
+            _sc = ("场景 %s" % self.cur_scene) if self.cur_scene else "启动中"
+            if self.pin_active:
+                _sc += (" [驻留 %d]" % self.pin_active) if self.pin_active > 0 \
+                    else " [驻留:本场]"
             self.v_status.set("运行中 %02d:%02d:%02d | %s | 本次 %d / 累计 %d%s"
                               % (el // 3600, el // 60 % 60, el % 60,
-                                 ("场景 %s" % self.cur_scene)
-                                 if self.cur_scene else "启动中",
-                                 self.wins, self.wins_total, extra))
+                                 _sc, self.wins, self.wins_total, extra))
         self.root.after(250, self._poll)
 
     def _gain_refresh(self):
