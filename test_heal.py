@@ -324,6 +324,8 @@ check("坏序列 -> 日志里说清楚", any("无效" in m for m in host5.logs),
 # 冷却本来会挡住第二次尝试, 这里把冷却时间拨回过去, 模拟"冷却已过"。
 botcfg.put("heal_seq", botcfg.SEQ_DEFAULT, CFG)
 botcfg.put("heal_gap", 0.01, CFG)
+botcfg.put("heal_every", 1, CFG)   # v19.3: host4 在文件里留了 every=2,
+                                   # 计数口径下 won=0 不该触发, 显式拨回 1
 H.POLL_TIMES = 1
 H.POLL_GAP = 0.001
 host6 = Host([F_MAP, F_MENU, F_STUCK])      # 脚本停在 STUCK -> 永不 settle
@@ -444,6 +446,111 @@ g = FakeG([F_MAP, F_MENU] + [F_MAP] * 6 + [F_MAP])
 r = macro(g).run(SEQ)
 check("无战斗时宏照常成功", r["ok"] is True and r["sent"] == SEQ,
       r["reason"])
+
+# ======================================================================
+print("=" * 66)
+print("第 11 节: v19.3 —— 窗口错过不是失败 / 计数口径 / 真失败才熔断")
+print("=" * 66)
+# 事故指纹 (2026-10-21): 密集怪区, 20/40/60 三连"当前在战斗里"(0 键发出),
+# 被旧口径当成连败 3 次 -> 存盘被停用, 4300+ 场没存过盘。
+# 新口径:
+#   a) 「开战中/中途进战斗」= timing 错过: 不计连败/不进冷却/不动计数,
+#      下一场战后自动补试;
+#   b) 触发口径 = 距上次成功存满 every 场 (错过不用再干等 N 场);
+#   c) 只有宏真跑完却收场错误的才算失败, 才进 FAIL_LIMIT 熔断。
+
+botcfg.CONFIG_PATH = CFG                     # 第 8 节结尾还原过了, 再钉回来
+botcfg.put("heal_after_battle", True, CFG)
+botcfg.put("heal_every", 20, CFG)
+botcfg.put("heal_gap", 0.01, CFG)
+
+host9 = Host([F_MAP] * 6)
+host9._heal_is_battle = lambda a: True          # 怪贴身: 宏一开始就开打
+host9.battles_won = 20                          # 正好到窗口
+r9 = host9.after_battle_heal(why="自动存盘 #20")
+check("窗口错过: 不发键", r9 is False and host9.g.keys == [])
+check("窗口错过: 不计连败", host9._heal_streak == 0, str(host9._heal_streak))
+check("窗口错过: 不进冷却", host9._heal_bail_t == 0.0)
+check("窗口错过: 不停用", host9._heal_off is False)
+check("窗口错过: 日志说「补存」",
+      any("窗口错过" in m and "补存" in m for m in host9.logs),
+      " ; ".join(host9.logs)[-50:])
+
+# 连续错过 9 个窗口 (won 21->29) 也绝不熔断
+for _w in range(21, 30):
+    host9.battles_won = _w
+    host9.after_battle_heal()
+check("连错 9 个窗口仍不停用/不计败",
+      host9._heal_off is False and host9._heal_streak == 0
+      and host9.heal_stat() == (0, 0), str(host9.heal_stat()))
+
+# 错过之后下一场 (won=30) 自动补试并成功 -> 计数推进, 之后 every 场内不再打
+host9._heal_is_battle = lambda a: False
+host9.g = FakeG([F_MAP, F_MENU, F_MAP])
+host9.battles_won = 30
+r9 = host9.after_battle_heal(why="自动存盘 #30")
+check("错过窗口下一场补试成功", r9 is True and len(host9.g.keys) >= 2)
+check("成功推进计数", getattr(host9, "_heal_last_won", 0) == 30)
+_k = len(host9.g.keys)
+host9.battles_won = 31
+host9.after_battle_heal()
+check("won=31 距上次 1 场 < 20 -> 零按键", len(host9.g.keys) == _k)
+host9.battles_won = 50
+host9.after_battle_heal()
+check("won=50 = 30+20 -> 又到窗口 (帧耗尽会真失败, 但确实发了键)",
+      len(host9.g.keys) > _k)
+
+# 真失败 (宏跑完收场错误) 依然进冷却/连败计数; 与窗口错过互不污染
+host10 = Host([F_MAP, F_MENU, F_STUCK])         # 永不 settle -> 真失败
+host10.battles_won = 100
+host10.after_battle_heal()
+check("真失败: 计败+进冷却",
+      host10._heal_streak == 1 and host10._heal_bail_t > 0)
+check("真失败: 计数也推进 (等满 every 场再试, 不逐场刷屏)",
+      getattr(host10, "_heal_last_won", 0) == 100)
+host10._heal_bail_t = 0.0
+host10.battles_won = 101                        # 101-100=1 < 20 -> 被计数闸挡住
+host10.after_battle_heal()
+check("真失败后 every 场内不重试", host10._heal_streak == 1
+      and host10._heal_fail_n == 1)
+
+# 混合场景: 2 次窗口错过 + 2 次真失败 -> 不停用 (旧口径这里已经熔断)
+host11 = Host([F_MAP] * 6)
+host11._heal_is_battle = lambda a: True
+for _w in (200, 201):
+    host11.battles_won = _w
+    host11.after_battle_heal()
+host11._heal_is_battle = lambda a: False
+for _w in (202, 222):                           # 两次真失败至少隔 every 场
+    host11.battles_won = _w
+    host11._heal_bail_t = 0.0
+    host11.after_battle_heal()
+check("2 错过 + 2 真失败 -> 仍启用", host11._heal_off is False
+      and host11._heal_streak == 2, "streak=%s" % host11._heal_streak)
+host11.battles_won = 241                        # 241-222=19 < 20 -> 闸住
+host11._heal_bail_t = 0.0
+host11.after_battle_heal()
+check("won=241 距上次真失败 19 场 -> 仍被闸住",
+      host11._heal_streak == 2 and host11._heal_off is False)
+host11.battles_won = 242
+host11.after_battle_heal()
+check("won=242 第 3 次真失败 -> 熔断", host11._heal_off is True)
+
+# run() 的 timing 旗标: 两处战斗拒绝都要打标
+keys = []
+m = macro_battle_script([True], [F_MAP])
+r = m.run(SEQ)
+check("开战中拒绝 -> timing=True", r["timing"] is True and r["ok"] is False)
+keys = []
+m = macro_battle_script([False, True], [F_MAP, F_MENU, F_STUCK])
+r = m.run(SEQ)
+check("中途进战斗 -> timing=True", r["timing"] is True and r["ok"] is False)
+g = FakeG([F_MAP, F_MENU] + [F_MAP] * 6 + [F_MAP])
+r = macro(g).run(SEQ)
+check("成功 -> timing=False", r["timing"] is False and r["ok"] is True)
+
+wipe_env()
+botcfg.CONFIG_PATH = REAL_CFG               # 还原, 别影响别的测试
 
 # ======================================================================
 print("=" * 66)

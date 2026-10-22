@@ -38,7 +38,8 @@
      这时若还硬按完剩下 7 个键, 会把游戏搅进完全无关的子页。
   ③ 收尾校验: 序列跑完必须"画面回到开宏前那张地图"。没回来就补 esc
      (最多 MAX_ESC_RETRY 次), 仍不回就走宿主自己的 escape_menu() 兜底,
-     并进入 BAIL_CD 冷却; 连续失败 FAIL_LIMIT 次 -> 本次运行内自动停用。
+     并进入 BAIL_CD 冷却; 连续真失败 FAIL_LIMIT 次 -> 本次运行内自动停用
+     (v19.3: "开战中/中途进战斗"是时间窗错过, 不算失败, 下一场战后补试)。
   ④ 中途战斗校验 (v19.1): **每个中间键发之前**确认没进新战斗 ——
      怪游走贴身无需走路也能触发战斗, 宏跑到一半的 enter 落进战斗
      指令菜单会把"攻击"选上、停在选人。战斗一开始立刻中止宏。
@@ -65,7 +66,9 @@ POLL_TIMES = 6            # 收尾轮询次数 (等施法动画放完)
 POLL_GAP = 0.45           # 每次轮询间隔 (秒)
 MAX_ESC_RETRY = 2         # 收尾没关掉时最多补几下 esc
 BAIL_CD = 180.0           # 宏失败后的冷却 (秒), 其间不再尝试
-FAIL_LIMIT = 3            # 连续失败这么多次 -> 本次运行自动停用
+FAIL_LIMIT = 3            # 连续**真失败**这么多次 -> 本次运行自动停用
+                          #   (v19.3 起"开战中/中途进战斗"是时间窗错过,
+                          #    不计入; 只有宏真跑完却收场错误的才算失败)
 
 
 def diff_frac(a, b, tol=24):
@@ -126,7 +129,7 @@ class HealMacro:
         keys = list(keys or [])
         res = {"ok": False, "reason": "", "sent": [], "opened": False,
                "closed": False, "esc_extra": 0, "elapsed": 0.0,
-               "keys": keys, "why": why}
+               "keys": keys, "why": why, "timing": False}
         if not keys:
             res["reason"] = "按键序列是空的"
             return res
@@ -137,6 +140,7 @@ class HealMacro:
             try:
                 if self.is_battle(a0):
                     res["reason"] = "当前在战斗里 -> 不执行 (菜单打不开)"
+                    res["timing"] = True          # ★ v19.3: 时间窗错过, 非宏故障
                     return res
             except Exception:
                 pass
@@ -175,6 +179,7 @@ class HealMacro:
                         res["reason"] = ("战斗中途开始 -> 中止宏 (已发 %d 键, "
                                          "防 enter 误选攻击)"
                                          % len(res["sent"]))
+                        res["timing"] = True      # ★ v19.3: 时间窗错过, 非宏故障
                         res["elapsed"] = time.time() - t0
                         return res
                 except Exception:
@@ -262,7 +267,8 @@ class HealMixin:
             cfg["err"] = str(e)
             cfg["src"] = "配置无效"
         self._heal_cfg = cfg
-        for k in ("_heal_ok_n", "_heal_fail_n", "_heal_streak", "_heal_bail_t"):
+        for k in ("_heal_ok_n", "_heal_fail_n", "_heal_streak", "_heal_bail_t",
+                  "_heal_last_won"):
             if not hasattr(self, k):
                 setattr(self, k, 0 if k != "_heal_bail_t" else 0.0)
         if not hasattr(self, "_heal_off"):
@@ -309,6 +315,15 @@ class HealMixin:
         """战斗结束后调用。返回 True = 这次真的跑完了宏。
 
         开关/场次/冷却/连败停用都在这儿判断 —— 关掉时一个键都不发。
+
+        ★ v19.3 触发口径 = 「距上次成功存盘已满 every 场」, 不是「场次号
+          能被 every 整除」。取模口径下, 一个窗口错过 (开战中) 就要再干等
+          N 场; 计数口径错过之后每一场战后都会补试, 直到成功。
+        ★ v19.3 失败分类: 「开战中」「宏中途进战斗」是**时间窗被怪吃掉**,
+          不是宏坏了 —— 不计连败、不进冷却、也不推进计数 (下一场再试);
+          只有宏真跑过却以错误画面收场的才算失败, 才进 FAIL_LIMIT 熔断。
+          (事故 2026-10-21: 密集怪区 20/40/60 三连"开战中", 被误计为
+          连败 3 次 -> 存盘被停用, 4300+ 场没存过盘。)
         """
         cfg = self.heal_load()
         if cfg["err"]:
@@ -326,7 +341,9 @@ class HealMixin:
                      % (self._heal_bail_t - now))
             return False
         won = int(getattr(self, "battles_won", 0))
-        if cfg["every"] > 1 and won % cfg["every"] != 0:
+        # every=1 = 每场都存 (保持旧口径, 无门槛); every>1 才用计数闸
+        if cfg["every"] > 1 and \
+                won - int(getattr(self, "_heal_last_won", 0)) < cfg["every"]:
             return False
 
         res = self.heal_macro(why)
@@ -335,11 +352,18 @@ class HealMixin:
         except Exception:
             pass
         if res["ok"]:
+            self._heal_last_won = won
             self._heal_ok_n += 1
             self._heal_streak = 0
             self.log("[存盘] %s 成功: %d 个键 (%.2fs, 补esc %d 次)"
                      % (why, len(res["sent"]), res["elapsed"], res["esc_extra"]))
+        elif res.get("timing"):
+            # 时间窗被怪吃掉 (开战中/宏中途进战斗): 不是宏坏了。
+            # 不计连败、不进冷却、不动 _heal_last_won -> 下一场战后自动补试。
+            self.log("[存盘] %s 窗口错过 (%s) -> 下一场战后补存"
+                     % (why, res["reason"]))
         else:
+            self._heal_last_won = won
             self._heal_fail_n += 1
             self._heal_streak += 1
             self._heal_bail_t = time.time() + BAIL_CD
